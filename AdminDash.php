@@ -1,13 +1,343 @@
+
 <?php
+
 session_start();
+
+// If not logged in, go back to login screen
+if (!isset($_SESSION['admin_login_id'])) {
+  header("Location: UserLogin.php");
+  exit();
+}
 include 'db.php';
 
-/* ------------------------------------------
-   OPTIONAL: auth check for admin (add yours)
-------------------------------------------- */
-// if (!isset($_SESSION['is_admin']) || !$_SESSION['is_admin']) {
-//   header('Location: UserLogin.php'); exit();
-// }
+// ===== Fetch logged-in admin data =====
+$admin_login_id = $_SESSION['admin_login_id'];
+
+$adminInfo = $conn->prepare("
+    SELECT 
+        a.admin_name,
+        a.admin_position,
+        a.profile_p
+    FROM admin a
+    WHERE a.login_id = ?
+");
+$adminInfo->bind_param("i", $admin_login_id);
+$adminInfo->execute();
+$adminData = $adminInfo->get_result()->fetch_assoc();
+$adminInfo->close();
+
+// Default fallback if something missing
+$sidebar_name = $adminData['admin_name'] ?? "Unknown Admin";
+$sidebar_position = $adminData['admin_position'] ?? "Administrator";
+$sidebar_profile = $adminData['profile_p'] ?? null;
+
+/* =======================================================
+   ADD ADMIN ACCOUNT (FIXED FOR YOUR admin TABLE STRUCTURE)
+   ======================================================= */
+
+$add_admin_success = '';
+$add_admin_error = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_admin'])) {
+
+  $admin_name = trim($_POST['admin_name'] ?? '');
+  $admin_position = trim($_POST['admin_position'] ?? '');
+  $email = trim($_POST['email'] ?? '');
+  $password = trim($_POST['password'] ?? '');
+
+  if (!$admin_name || !$admin_position || !$email || !$password) {
+    $add_admin_error = "All fields are required.";
+  } else {
+
+    // Handle profile picture
+    $profile_pic_data = null;
+    if (isset($_FILES['profile_p']) && $_FILES['profile_p']['error'] === UPLOAD_ERR_OK) {
+      $profile_pic_data = file_get_contents($_FILES['profile_p']['tmp_name']);
+    }
+
+    // Check duplicate email in student_login
+    $check = $conn->prepare("SELECT 1 FROM student_login WHERE email = ?");
+    $check->bind_param("s", $email);
+    $check->execute();
+    $check_res = $check->get_result();
+
+    if ($check_res->num_rows > 0) {
+      $add_admin_error = "This email is already registered.";
+    } else {
+
+      // Step 1: Insert login account
+      $hashed = password_hash($password, PASSWORD_DEFAULT);
+
+      $stmt_login = $conn->prepare("
+                   INSERT INTO student_login (email, password) 
+                   VALUES (?, ?)
+               ");
+      if (!$stmt_login) {
+        $add_admin_error = "Login prepare failed: " . $conn->error;
+      } else {
+        $stmt_login->bind_param("ss", $email, $hashed);
+
+        if ($stmt_login->execute()) {
+
+          $login_id = $stmt_login->insert_id;
+          $stmt_login->close();
+
+          // Step 2: Insert admin profile
+          $stmt_admin = $conn->prepare("
+                           INSERT INTO admin 
+                           (login_id, admin_name, admin_position, profile_p)
+                           VALUES (?, ?, ?, ?)
+                       ");
+
+          if (!$stmt_admin) {
+            $add_admin_error = "Admin prepare failed: " . $conn->error;
+
+          } else {
+
+            $null = NULL;
+            $stmt_admin->bind_param(
+              "issb",
+              $login_id,
+              $admin_name,
+              $admin_position,
+              $null
+            );
+
+            if ($profile_pic_data !== null) {
+              $stmt_admin->send_long_data(3, $profile_pic_data);
+            }
+
+            if ($stmt_admin->execute()) {
+              $add_admin_success = "Admin successfully added!";
+            } else {
+              $add_admin_error = "Admin insert failed: " . $stmt_admin->error;
+            }
+
+            $stmt_admin->close();
+          }
+
+        } else {
+          $add_admin_error = "Login insert failed: " . $stmt_login->error;
+        }
+      }
+    }
+  }
+}
+
+/* Student sends a message (sender='student') */
+if (
+  $_SERVER['REQUEST_METHOD'] === 'POST'
+  && isset($_POST['action']) && $_POST['action'] === 'chat_send_student'
+) {
+  header('Content-Type: application/json');
+  $sid = isset($_POST['student_id']) ? (int) $_POST['student_id'] : 0;
+  $msg = trim($_POST['message'] ?? '');
+  if ($sid <= 0) {
+    echo json_encode(['ok' => false, 'msg' => 'Missing student_id']);
+    exit;
+  }
+  if ($msg === '') {
+    echo json_encode(['ok' => false, 'msg' => 'Message cannot be empty.']);
+    exit;
+  }
+  try {
+    $stmt = $conn->prepare("INSERT INTO chat_messages (student_id, sender, message) VALUES (?, 'student', ?)");
+    $stmt->bind_param('is', $sid, $msg);
+    $stmt->execute();
+    $newId = $stmt->insert_id;
+    $stmt->close();
+    echo json_encode(['ok' => true, 'message' => ['id' => $newId, 'sender' => 'student', 'message' => $msg]]);
+  } catch (Throwable $e) {
+    error_log('chat_send_student ERR: ' . $e->getMessage());
+    echo json_encode(['ok' => false, 'msg' => 'Failed to send.']);
+  }
+  exit;
+}
+
+/* Student fetches conversation (both sides), same as admin but by self */
+if (isset($_GET['action']) && $_GET['action'] === 'chat_fetch_student') {
+  header('Content-Type: application/json');
+  $sid = isset($_GET['student_id']) ? (int) $_GET['student_id'] : 0;
+  $since_id = isset($_GET['since_id']) ? (int) $_GET['since_id'] : 0;
+  if ($sid <= 0) {
+    echo json_encode(['ok' => false, 'msg' => 'Missing student_id']);
+    exit;
+  }
+  try {
+    if ($since_id > 0) {
+      $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                              FROM chat_messages
+                              WHERE student_id = ? AND id > ?
+                              ORDER BY id ASC
+                              LIMIT 500");
+      $stmt->bind_param('ii', $sid, $since_id);
+    } else {
+      $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                              FROM chat_messages
+                              WHERE student_id = ?
+                              ORDER BY id ASC
+                              LIMIT 500");
+      $stmt->bind_param('i', $sid);
+    }
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $rows = [];
+    while ($r = $res->fetch_assoc())
+      $rows[] = $r;
+    $stmt->close();
+    echo json_encode(['ok' => true, 'messages' => $rows]);
+  } catch (Throwable $e) {
+    error_log('chat_fetch_student ERR: ' . $e->getMessage());
+    echo json_encode(['ok' => false, 'msg' => 'Failed to fetch.']);
+  }
+  exit;
+}
+
+try {
+  @$conn->query("CREATE TABLE IF NOT EXISTS chat_messages (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id INT NOT NULL,
+    sender ENUM('student','admin') NOT NULL,
+    message TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX (student_id),
+    INDEX (created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+} catch (Throwable $e) {
+  error_log('CHAT TABLE ENSURE (admin): ' . $e->getMessage());
+}
+
+/* Threads list: latest per student, with unread count for admin */
+if (isset($_GET['action']) && $_GET['action'] === 'chat_threads') {
+  header('Content-Type: application/json');
+  try {
+    // Latest message per student
+    $sql = "
+      SELECT cm.student_id,
+             s.fullname,
+             MAX(cm.id) AS last_id
+      FROM chat_messages cm
+      LEFT JOIN students s ON s.id = cm.student_id
+      GROUP BY cm.student_id, s.fullname
+      ORDER BY last_id DESC
+      LIMIT 500
+    ";
+    $rs = $conn->query($sql);
+    $threads = [];
+    $lastIds = [];
+    while ($row = $rs->fetch_assoc()) {
+      $lastIds[(int) $row['student_id']] = (int) $row['last_id'];
+      $threads[] = [
+        'student_id' => (int) $row['student_id'],
+        'fullname' => $row['fullname'] ?: ('Student #' . (int) $row['student_id']),
+        'last_id' => (int) $row['last_id'],
+      ];
+    }
+    // Fetch last message and unread count
+    foreach ($threads as &$t) {
+      $lid = $t['last_id'];
+      // last message details
+      $q = $conn->prepare("SELECT sender, message, created_at FROM chat_messages WHERE id=?");
+      $q->bind_param('i', $lid);
+      $q->execute();
+      $res = $q->get_result()->fetch_assoc();
+      $q->close();
+      $t['last_sender'] = $res['sender'] ?? null;
+      $t['last_message'] = $res['message'] ?? '';
+      $t['last_time'] = $res['created_at'] ?? null;
+
+      // unread for admin = messages from student newer than last admin message id
+      $q2 = $conn->prepare("
+        SELECT COUNT(*) AS unread
+        FROM chat_messages
+        WHERE student_id = ? AND sender='student' AND id >
+              COALESCE((
+                SELECT MAX(id) FROM chat_messages
+                WHERE student_id = ? AND sender='admin'
+              ), 0)
+      ");
+      $q2->bind_param('ii', $t['student_id'], $t['student_id']);
+      $q2->execute();
+      $res2 = $q2->get_result()->fetch_assoc();
+      $q2->close();
+      $t['unread'] = (int) ($res2['unread'] ?? 0);
+    }
+    echo json_encode(['ok' => true, 'threads' => $threads]);
+  } catch (Throwable $e) {
+    error_log('chat_threads ERR: ' . $e->getMessage());
+    echo json_encode(['ok' => false, 'msg' => 'Failed to load threads.']);
+  }
+  exit;
+}
+
+/* Fetch messages for a student (admin view) */
+if (isset($_GET['action']) && $_GET['action'] === 'chat_fetch_admin') {
+  header('Content-Type: application/json');
+  $sid = isset($_GET['student_id']) ? (int) $_GET['student_id'] : 0;
+  $since_id = isset($_GET['since_id']) ? (int) $_GET['since_id'] : 0;
+  if ($sid <= 0) {
+    echo json_encode(['ok' => false, 'msg' => 'Missing student_id']);
+    exit;
+  }
+  try {
+    if ($since_id > 0) {
+      $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                              FROM chat_messages
+                              WHERE student_id = ? AND id > ?
+                              ORDER BY id ASC
+                              LIMIT 500");
+      $stmt->bind_param('ii', $sid, $since_id);
+    } else {
+      $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                              FROM chat_messages
+                              WHERE student_id = ?
+                              ORDER BY id DESC
+                              LIMIT 200");
+      $stmt->bind_param('i', $sid);
+    }
+    $stmt->execute();
+    $res = $stmt->get_result();
+    $rows = [];
+    while ($r = $res->fetch_assoc())
+      $rows[] = $r;
+    $stmt->close();
+    if ($since_id === 0)
+      $rows = array_reverse($rows);
+    echo json_encode(['ok' => true, 'messages' => $rows]);
+  } catch (Throwable $e) {
+    error_log('chat_fetch_admin ERR: ' . $e->getMessage());
+    echo json_encode(['ok' => false, 'msg' => 'Failed to fetch messages.']);
+  }
+  exit;
+}
+
+/* Send message from admin to a student */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'chat_send_admin') {
+  header('Content-Type: application/json');
+  $sid = isset($_POST['student_id']) ? (int) $_POST['student_id'] : 0;
+  $msg = trim($_POST['message'] ?? '');
+  if ($sid <= 0) {
+    echo json_encode(['ok' => false, 'msg' => 'Missing student_id']);
+    exit;
+  }
+  if ($msg === '') {
+    echo json_encode(['ok' => false, 'msg' => 'Message cannot be empty.']);
+    exit;
+  }
+  try {
+    $stmt = $conn->prepare("INSERT INTO chat_messages (student_id, sender, message) VALUES (?, 'admin', ?)");
+    $stmt->bind_param('is', $sid, $msg);
+    $stmt->execute();
+    $newId = $stmt->insert_id;
+    $stmt->close();
+    echo json_encode(['ok' => true, 'message' => ['id' => $newId, 'sender' => 'admin', 'message' => $msg]]);
+  } catch (Throwable $e) {
+    error_log('chat_send_admin ERR: ' . $e->getMessage());
+    echo json_encode(['ok' => false, 'msg' => 'Failed to send.']);
+  }
+  exit;
+}
+/* ========== END of added admin chat server APIs ========== */
 
 /* ------------------------------------------
    Add Student (your original code - unchanged)
@@ -419,8 +749,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     }
 
     .profile-pic {
-      width: 90px;
-      height: 90px;
+      width: 100px;
+      height: 100px;
       border-radius: 999px;
       object-fit: cover;
       border: 2px solid #374151;
@@ -717,7 +1047,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
 
     .additem-panel {
       background: #fff;
-      width: min(980px, 95vw);
+      width: min(900px, 95vw) !important;
       max-height: 96vh;
       overflow: hidden;
       border-radius: 14px;
@@ -985,14 +1315,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       padding: 10px 0;
     }
 
-    .pp-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: #ddd;
-      cursor: pointer;
-    }
-
     .pp-dot.active {
       background: #ee4d2d;
     }
@@ -1088,7 +1410,149 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     .note {
       color: #6b7280;
       font-size: 12px;
-      margin-top: 6px;
+    }
+
+    /* ===== Panels (Add Student / Add Admin) ===== */
+
+    #panelAddStudent,
+    #panelAddAdmin {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, .5);
+      z-index: 5000;
+      padding: 20px;
+      overflow: auto;
+    }
+
+    #panelAddStudent.show,
+    #panelAddAdmin.show {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Panel body */
+    .additem-panel {
+      width: min(420px, 95%);
+      background: #ffffff;
+      border-radius: 14px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, .25);
+      overflow: hidden;
+      animation: scaleIn .25s ease;
+    }
+
+    @keyframes scaleIn {
+      from {
+        transform: scale(.85);
+        opacity: 0;
+      }
+
+      to {
+        transform: scale(1);
+        opacity: 1;
+      }
+    }
+
+    /* Header */
+    .additem-header {
+      background: #111827;
+      padding: 14px 18px;
+      color: #fff;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .additem-title {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .additem-header .ck-close {
+      background: rgba(255, 255, 255, .2);
+      color: #fff;
+      border: none;
+      padding: 6px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: .2s;
+    }
+
+    .additem-header .ck-close:hover {
+      background: rgba(255, 255, 255, .35);
+    }
+
+    /* Body */
+    .additem-body {
+      padding: 20px 22px;
+    }
+
+    /* Form styling */
+    #panelAddStudent form,
+    #panelAddAdmin form {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    #panelAddStudent label,
+    #panelAddAdmin label {
+      font-weight: 600;
+      font-size: 14px;
+      color: #111827;
+    }
+
+    #panelAddStudent input,
+    #panelAddAdmin input {
+      padding: 10px 12px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: 1px solid #cbd5e1;
+      outline: none;
+      transition: border-color .2s ease;
+    }
+
+    #panelAddStudent input:focus,
+    #panelAddAdmin input:focus {
+      border-color: #2563eb;
+    }
+
+    /* Save buttons */
+    #panelAddStudent button.btn-chip.primary,
+    #panelAddAdmin button.btn-chip.primary {
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #fff;
+      font-weight: 700;
+      border-radius: 8px;
+      padding: 10px;
+      cursor: pointer;
+      transition: background .25s ease;
+    }
+
+    #panelAddStudent button.btn-chip.primary:hover,
+    #panelAddAdmin button.btn-chip.primary:hover {
+      background: #1d4ed8;
+    }
+
+    /* Open panel buttons */
+    #openAddStudent,
+    #openAddAdmin {
+      background: #2563eb;
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: none;
+      color: #fff;
+      font-weight: bold;
+      cursor: pointer;
+      transition: background .25s ease;
+    }
+
+    #openAddStudent:hover,
+    #openAddAdmin:hover {
+      background: #1d4ed8;
     }
   </style>
 </head>
@@ -1107,13 +1571,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
   <!-- ===== Sidebar ===== -->
   <div id="sidebar" class="sidebar">
     <div class="sidebar-content">
-      <img src="admin.jpeg" alt="Profile Picture" class="profile-pic" id="sidebarProfilePic">
-      <p class="profile-name" id="sidebarName">Rizal, Jose</p>
-      <p class="course" id="sidebarCourse">Admin 1</p>
+      <img
+        src="<?php echo $sidebar_profile ? 'data:image/jpeg;base64,' . base64_encode($sidebar_profile) : 'logo.png'; ?>"
+        alt="Profile Picture" class="profile-pic" id="sidebarProfilePic">
+
+      <p class="profile-name" id="sidebarName">
+        <?php echo htmlspecialchars($sidebar_name); ?>
+      </p>
+
+      <p class="course" id="sidebarCourse">
+        <?php echo htmlspecialchars($sidebar_position); ?>
+      </p>
+
       <button class="sidebar-btn" id="homeBut">Home</button>
       <button class="sidebar-btn" id="ordersBtn">Orders</button>
       <button class="sidebar-btn" id="stocksBtn">Stocks</button>
-      <button class="sidebar-btn" id="manualAddBtn">Manual Add</button>
+      <button class="sidebar-btn" id="manualAddBtn">Account Management</button>
       <button class="sidebar-btn">Notifications</button>
     </div>
     <button class="signout-btn" id="signoutBtn">Sign Out</button>
@@ -1272,25 +1745,180 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     </table>
   </section>
 
-  <!-- ===== Manual Add Student (unchanged) ===== -->
+  <!-- ===== Manual Add / Users Table ===== -->
   <section class="manual-section" id="manualAddSection">
-    <h1 class="dashboard-title">Add Student</h1>
-    <div class="manual-form">
-      <?php if ($error): ?>
-        <p style="color:red;text-align:center;"><?= htmlspecialchars($error) ?></p><?php endif; ?>
-      <?php if ($success): ?>
-        <p style="color:green;text-align:center;"><?= htmlspecialchars($success) ?></p><?php endif; ?>
-      <form method="POST" enctype="multipart/form-data">
-        <label>Full Name</label><input type="text" name="fullname" required>
-        <label>SR-Code</label><input type="text" name="sr_code" required>
-        <label>Gsuite Email</label><input type="email" name="gsuite_email" required>
-        <label>Course</label><input type="text" name="course" required>
-        <label>Profile Picture</label><input type="file" name="profile_pic" accept="image/*">
-        <label>Password</label><input type="password" name="password" required>
-        <button type="submit" name="add_student">Add Student</button>
-      </form>
+    <?php
+    if (!empty($add_admin_success)) {
+      echo "<p style='color:green;margin:10px 0;'>$add_admin_success</p>";
+    }
+    if (!empty($add_admin_error)) {
+      echo "<p style='color:red;margin:10px 0;'>$add_admin_error</p>";
+    }
+    ?>
+
+    <h1 class="dashboard-title">Account Management</h1>
+
+    <div style="display:flex; justify-content:flex-end; gap:10px; margin-bottom:20px;">
+      <button id="openAddStudent" class="sidebar-btn" style="width:auto;">Add Student</button>
+      <button id="openAddAdmin" class="sidebar-btn" style="width:auto;">Add Admin</button>
     </div>
+
+    <!-- USERS TABLE -->
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>FULL NAME</th>
+          <th>EMAIL</th>
+          <th>USER TYPE</th>
+          <th>STATUS</th>
+          <th>LAST ONLINE</th>
+        </tr>
+      </thead>
+
+      <tbody>
+
+        <?php
+        /* ======================================
+           FETCH STUDENTS
+           ====================================== */
+        $students = $conn->query("
+    SELECT 
+        id AS uid,
+        fullname,
+        gsuite_email AS email,
+        status,
+        last_online
+    FROM students
+    ORDER BY id DESC
+");
+
+        /* ======================================
+           FETCH ADMINS (FIXED JOIN)
+           ====================================== */
+        $admins = $conn->query("
+    SELECT 
+        a.admin_id AS uid,
+        a.admin_name AS fullname,
+        sl.email,
+        a.status,
+        a.last_online
+    FROM admin a
+    LEFT JOIN student_login sl ON sl.login_id = a.login_id
+    ORDER BY a.admin_id DESC
+");
+
+        /* ======================================
+           DISPLAY STUDENTS
+           ====================================== */
+        if ($students) {
+          while ($s = $students->fetch_assoc()) {
+
+            if ($s['status'] === 'online') {
+              $status_badge = "<span style='color:green;font-weight:bold;'>● Online</span>";
+              $last_online = "—";
+            } else {
+              $status_badge = "<span style='color:red;font-weight:bold;'>● Offline</span>";
+              $last_online = $s['last_online'] ?: "—";
+            }
+
+            echo "
+        <tr>
+            <td>{$s['uid']}</td>
+            <td>" . htmlspecialchars($s['fullname']) . "</td>
+            <td>" . htmlspecialchars($s['email']) . "</td>
+            <td style='color:#2563eb;font-weight:bold;'>Student</td>
+            <td>{$status_badge}</td>
+            <td>{$last_online}</td>
+        </tr>";
+          }
+        }
+
+        /* ======================================
+           DISPLAY ADMINS (NOW WORKS)
+           ====================================== */
+        if ($admins) {
+          while ($a = $admins->fetch_assoc()) {
+
+            if ($a['status'] === 'online') {
+              $status_badge = "<span style='color:green;font-weight:bold;'>● Online</span>";
+              $last_online = "—";
+            } else {
+              $status_badge = "<span style='color:red;font-weight:bold;'>● Offline</span>";
+              $last_online = $a['last_online'] ?: "—";
+            }
+
+            echo "
+        <tr>
+            <td>{$a['uid']}</td>
+            <td>" . htmlspecialchars($a['fullname']) . "</td>
+            <td>" . htmlspecialchars($a['email']) . "</td>
+            <td style='color:#dc2626;font-weight:bold;'>Admin</td>
+            <td>{$status_badge}</td>
+            <td>{$last_online}</td>
+        </tr>";
+          }
+        }
+        ?>
+
+      </tbody>
+
+    </table>
+
+
   </section>
+  <!-- Add Student Panel -->
+  <div id="panelAddStudent" class="additem-modal">
+    <div class="additem-panel">
+      <div class="additem-header">
+        <h3 class="additem-title">Add Student</h3>
+        <button class="ck-close"
+          onclick="document.getElementById('panelAddStudent').classList.remove('show')">×</button>
+      </div>
+
+      <div class="additem-body">
+        <form method="POST" enctype="multipart/form-data">
+          <label>Full Name</label><input type="text" name="fullname" required>
+          <label>SR-Code</label><input type="text" name="sr_code" required>
+          <label>Gsuite Email</label><input type="email" name="gsuite_email" required>
+          <label>Course</label><input type="text" name="course" required>
+          <label>Profile Picture</label><input type="file" name="profile_pic" accept="image/*">
+          <label>Password</label><input type="password" name="password" required>
+          <button type="submit" name="add_student" class="btn-chip primary" style="margin-top:15px;">Add
+            Student</button>
+        </form>
+      </div>
+    </div>
+  </div>
+  <!-- Add Admin Panel -->
+  <div id="panelAddAdmin" class="additem-modal">
+    <div class="additem-panel">
+      <div class="additem-header">
+        <h3 class="additem-title">Add Admin</h3>
+        <button class="ck-close" onclick="document.getElementById('panelAddAdmin').classList.remove('show')">×</button>
+      </div>
+
+      <div class="additem-body">
+        <form method="POST" enctype="multipart/form-data">
+          <label>Admin Name</label>
+          <input type="text" name="admin_name" required>
+
+          <label>Admin Position</label>
+          <input type="text" name="admin_position" required>
+
+          <label>Profile Picture</label>
+          <input type="file" name="profile_p" accept="image/*">
+          <label>Email</label>
+          <input type="text" name="email" required>
+          <label>Password</label>
+          <input type="password" name="password" required>
+
+          <button type="submit" name="add_admin" class="btn-chip primary" style="margin-top:15px;">Add Admin</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
 
   <!-- ===== Add/Edit Item Modal (same modal; now supports edit) ===== -->
   <div id="addItemModalFE" class="additem-modal" aria-hidden="true">
@@ -1474,18 +2102,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     // Keep sections after POSTs
     <?php if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['add_student'])): ?>
       show(manualAddSection);
-        <?php if (!empty($success)): ?> alert("<?= addslashes($success); ?>"); <?php endif; ?>
-        <?php if (!empty($error)): ?> alert("<?= addslashes($error); ?>"); <?php endif; ?>
+          <?php if (!empty($success)): ?> alert("<?= addslashes($success); ?>"); <?php endif; ?>
+          <?php if (!empty($error)): ?> alert("<?= addslashes($error); ?>"); <?php endif; ?>
     <?php endif; ?>
 
     <?php if ($_SERVER["REQUEST_METHOD"] == "POST" && (isset($_POST['add_item']) || isset($_POST['update_item']) || isset($_POST['delete_item']))): ?>
       show(stocksPage);
-        <?php if (!empty($add_item_success)): ?> alert("<?= addslashes($add_item_success); ?>"); <?php endif; ?>
-        <?php if (!empty($add_item_error)): ?> alert("<?= addslashes($add_item_error); ?>"); <?php endif; ?>
-        <?php if (!empty($update_item_success)): ?> alert("<?= addslashes($update_item_success); ?>"); <?php endif; ?>
-        <?php if (!empty($update_item_error)): ?> alert("<?= addslashes($update_item_error); ?>"); <?php endif; ?>
-        <?php if (!empty($delete_item_success)): ?> alert("<?= addslashes($delete_item_success); ?>"); <?php endif; ?>
-        <?php if (!empty($delete_item_error)): ?> alert("<?= addslashes($delete_item_error); ?>"); <?php endif; ?>
+          <?php if (!empty($add_item_success)): ?> alert("<?= addslashes($add_item_success); ?>"); <?php endif; ?>
+          <?php if (!empty($add_item_error)): ?> alert("<?= addslashes($add_item_error); ?>"); <?php endif; ?>
+          <?php if (!empty($update_item_success)): ?> alert("<?= addslashes($update_item_success); ?>"); <?php endif; ?>
+          <?php if (!empty($update_item_error)): ?> alert("<?= addslashes($update_item_error); ?>"); <?php endif; ?>
+          <?php if (!empty($delete_item_success)): ?> alert("<?= addslashes($delete_item_success); ?>"); <?php endif; ?>
+          <?php if (!empty($delete_item_error)): ?> alert("<?= addslashes($delete_item_error); ?>"); <?php endif; ?>
     <?php endif; ?>
 
       // ===== Add/Edit Item Modal (wired to backend; stays a modal) =====
@@ -1810,6 +2438,741 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
 
       })();
   </script>
+
+  <!-- =========================
+     APPEND-ONLY: RGO Inbox (Admin)
+     ========================= -->
+  <style>
+    .rgo-inbox {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      width: 920px;
+      max-width: calc(100vw - 36px);
+      height: 560px;
+      max-height: calc(100vh - 36px);
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 16px;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, .18);
+      display: none;
+      z-index: 6000;
+      overflow: hidden
+    }
+
+    .rgo-inbox .hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: #111827;
+      color: #fff
+    }
+
+    .rgo-inbox .title {
+      font-weight: 800;
+      margin: 0;
+      font-size: 15px
+    }
+
+    .rgo-inbox .x {
+      border: none;
+      background: rgba(255, 255, 255, .18);
+      color: #fff;
+      font-size: 18px;
+      line-height: 1;
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      cursor: pointer
+    }
+
+    .rgo-inbox .body {
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      height: calc(100% - 52px)
+    }
+
+    .rgo-threads {
+      border-right: 1px solid #eee;
+      overflow: auto;
+      background: #fafafa
+    }
+
+    .rgo-thread {
+      padding: 10px 12px;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      gap: 10px;
+      cursor: pointer
+    }
+
+    .rgo-thread:hover {
+      background: #f1f5f9
+    }
+
+    .rgo-thread .av {
+      width: 36px;
+      height: 36px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      background: #111827;
+      color: #fff;
+      font-weight: 800
+    }
+
+    .rgo-thread .tx {
+      flex: 1;
+      min-width: 0
+    }
+
+    .rgo-thread .nm {
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    .rgo-thread .lm {
+      font-size: 12px;
+      color: #475569;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis
+    }
+
+    .rgo-thread .time {
+      font-size: 12px;
+      color: #64748b
+    }
+
+    .rgo-thread .badge {
+      background: #ef4444;
+      color: #fff;
+      border-radius: 999px;
+      font-size: 11px;
+      padding: 2px 8px;
+      margin-left: auto;
+      height: fit-content
+    }
+
+    .rgo-msgs {
+      display: flex;
+      flex-direction: column;
+      height: 100%
+    }
+
+    .rgo-msg-list {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+      background: #fff
+    }
+
+    .rgo-empty {
+      color: #64748b;
+      text-align: center;
+      margin-top: 16px
+    }
+
+    .rgo-bubble {
+      max-width: 72%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      margin: 6px 0;
+      font-size: 14px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      word-wrap: break-word
+    }
+
+    .rgo-me {
+      background: #e6f2ff;
+      color: #0b5394;
+      margin-left: auto;
+      border-top-right-radius: 4px
+    }
+
+    .rgo-st {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      color: #111827;
+      border-top-left-radius: 4px
+    }
+
+    .rgo-input {
+      display: grid;
+      grid-template-columns: 1fr 96px;
+      gap: 8px;
+      padding: 10px;
+      background: #fff;
+      border-top: 1px solid #eee
+    }
+
+    .rgo-input input {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none
+    }
+
+    .rgo-input button {
+      background: #111827;
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-weight: 800;
+      cursor: pointer
+    }
+
+    .rgo-msgs {
+      min-height: 0 !important;
+    }
+
+    /* Give the list its own vertical scroller */
+    .rgo-msg-list {
+      overflow-y: auto !important;
+      overflow-x: hidden;
+      max-height: 100% !important;
+      -webkit-overflow-scrolling: touch;
+      /* iOS smooth */
+      overscroll-behavior: contain;
+      /* keep scroll inside the pane */
+    }
+
+    /* Optional: always show a slim scrollbar on desktop */
+    .rgo-msg-list::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .rgo-msg-list::-webkit-scrollbar-track {
+      background: #f3f4f6;
+      border-radius: 8px;
+    }
+
+    .rgo-msg-list::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 8px;
+    }
+
+    .rgo-msg-list:hover::-webkit-scrollbar-thumb {
+      background: #94a3b8;
+    }
+
+    /* Keep the whole inbox sized so the inner area can scroll nicely */
+    .rgo-inbox {
+      height: 560px;
+      max-height: calc(100vh - 36px);
+    }
+
+    .rgo-inbox .body {
+      height: calc(100% - 52px);
+    }
+
+    /* header is ~52px */
+
+    .sidebar .sidebar-btn:is(:where(:first-child, :not(:first-child))) {
+      /* We’ll target it precisely via JS and set display:none; this is fallback */
+    }
+
+    .sidebar .sidebar-btn[data-rgo-notifs="1"] {
+      display: none !important;
+    }
+
+    /* Threads panel: FB-ish look */
+    .rgo-threads {
+      background: #fff !important;
+      border-right: 1px solid #e5e7eb;
+    }
+
+    .rgo-thread {
+      padding: 12px 14px !important;
+      align-items: center;
+      border-bottom: 1px solid #f1f5f9 !important;
+      border-radius: 0 !important;
+    }
+
+    .rgo-thread:hover {
+      background: #f8fafc !important;
+    }
+
+    .rgo-thread .av {
+      width: 40px;
+      height: 40px;
+      border-radius: 999px;
+      font-weight: 800;
+      background: #2563eb !important;
+    }
+
+    .rgo-thread .tx {
+      display: flex;
+      flex-direction: column;
+      gap: 2px
+    }
+
+    .rgo-thread .nm {
+      font-weight: 600 !important;
+      color: #0f172a;
+    }
+
+    .rgo-thread .lm {
+      color: #475569 !important;
+      font-size: 13px;
+      max-width: 260px;
+    }
+
+    .rgo-thread .time {
+      color: #94a3b8 !important;
+      font-size: 12px;
+      margin-left: 8px;
+      white-space: nowrap;
+    }
+
+    /* Unread styling */
+    .rgo-thread.unread .nm {
+      font-weight: 800 !important;
+    }
+
+    .rgo-thread.unread .lm {
+      color: #0f172a !important;
+      font-weight: 600;
+    }
+
+    .rgo-thread .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: #2563eb;
+      margin-left: 8px;
+    }
+
+    /* Sticky search on top of the threads */
+    .rgo-recents-head {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #fff;
+      border-bottom: 1px solid #e5e7eb;
+      padding: 10px;
+    }
+
+    .rgo-search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid #e5e7eb;
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: #f8fafc;
+    }
+
+    .rgo-search input {
+      flex: 1;
+      border: none;
+      background: transparent;
+      outline: none;
+      font-size: 14px;
+    }
+
+    /* Floating Messenger button (bottom-right) */
+    .rgo-fab {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 6500;
+      width: 58px;
+      height: 58px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      background: #2563eb;
+      color: #fff;
+      box-shadow: 0 10px 24px rgba(2, 6, 23, .24);
+      display: grid;
+      place-items: center;
+      font-size: 24px;
+      line-height: 1;
+    }
+
+    .rgo-fab:hover {
+      filter: brightness(1.05);
+    }
+
+    /* Make threads column a little wider like FB */
+    .rgo-inbox .body {
+      grid-template-columns: 340px 1fr !important;
+    }
+  </style>
+
+  <script>
+    (function () {
+      // UI shell
+      const inbox = document.createElement('div');
+      inbox.className = 'rgo-inbox';
+      inbox.innerHTML = `
+    <div class="hdr">
+      <div class="title">RGO Inbox</div>
+      <button class="x" aria-label="Close">×</button>
+    </div>
+    <div class="body">
+      <div class="rgo-threads" id="rgoThreads"></div>
+      <div class="rgo-msgs">
+        <div class="rgo-msg-list" id="rgoMsgList"><div class="rgo-empty" id="rgoEmpty">Select a conversation.</div></div>
+        <div class="rgo-input">
+          <input type="text" id="rgoInput" placeholder="Type a reply..." maxlength="1000"/>
+          <button id="rgoSend">Send</button>
+        </div>
+      </div>
+    </div>
+  `;
+      document.body.appendChild(inbox);
+
+      const threadsEl = inbox.querySelector('#rgoThreads');
+      const msgList = inbox.querySelector('#rgoMsgList');
+      const input = inbox.querySelector('#rgoInput');
+      const sendBtn = inbox.querySelector('#rgoSend');
+      const empty = inbox.querySelector('#rgoEmpty');
+      const closeBtn = inbox.querySelector('.x');
+
+      let activeSid = null;
+      let lastMsgId = 0;
+      let pollThreads = null;
+      let pollMsgs = null;
+      const POLL = 3500;
+
+      function openInbox() {
+        inbox.style.display = 'block';
+        refreshThreads();
+        if (!pollThreads) pollThreads = setInterval(refreshThreads, POLL);
+        if (activeSid && !pollMsgs) pollMsgs = setInterval(fetchMsgs, POLL);
+        setTimeout(() => input.focus(), 80);
+      }
+      function closeInbox() {
+        inbox.style.display = 'none';
+        if (pollThreads) { clearInterval(pollThreads); pollThreads = null; }
+        if (pollMsgs) { clearInterval(pollMsgs); pollMsgs = null; }
+      }
+      closeBtn.addEventListener('click', closeInbox);
+
+      // Hook your existing "Notifications" button to open Inbox (no HTML edits)
+      document.querySelector('.sidebar')?.addEventListener('click', (e) => {
+        const t = e.target;
+        if (t.classList.contains('sidebar-btn') && /notifications/i.test(t.textContent || '')) {
+          const sb = document.getElementById('sidebar'); const ov = document.getElementById('overlay');
+          sb?.classList.remove('open'); ov?.classList.remove('show');
+          openInbox();
+        }
+      });
+
+      function el(tag, cls, txt) { const d = document.createElement(tag); if (cls) d.className = cls; if (txt !== undefined) d.textContent = txt; return d; }
+      function fmtTime(iso) { if (!iso) return ''; try { const d = new Date(iso.replace(' ', 'T')); return d.toLocaleString(); } catch { return iso; } }
+      function scrollToBottom() { msgList.scrollTop = msgList.scrollHeight; }
+
+      function addBubble(sender, message) {
+        if (empty) empty.style.display = 'none';
+        const b = el('div', 'rgo-bubble ' + (sender === 'admin' ? 'rgo-me' : 'rgo-st'));
+        b.textContent = message;
+        msgList.appendChild(b);
+      }
+
+      async function refreshThreads() {
+        try {
+          const res = await fetch(`${location.pathname.split('/').pop()}?action=chat_threads`);
+          const data = await res.json();
+          if (!data.ok) return;
+          const list = Array.isArray(data.threads) ? data.threads : [];
+          threadsEl.innerHTML = '';
+          list.forEach(th => {
+            const row = el('div', 'rgo-thread'); row.dataset.sid = th.student_id;
+            const av = el('div', 'av', (th.fullname || 'S')[0]?.toUpperCase() || 'S');
+            const tx = el('div', 'tx');
+            const nm = el('div', 'nm', th.fullname || ('Student #' + th.student_id));
+            const lm = el('div', 'lm', (th.last_sender === 'admin' ? 'You: ' : '') + (th.last_message || ''));
+            const rt = el('div'); rt.style.marginLeft = 'auto'; rt.style.textAlign = 'right';
+            const tm = el('div', 'time', fmtTime(th.last_time)); rt.appendChild(tm);
+            if ((th.unread || 0) > 0) rt.appendChild(el('div', 'badge', String(th.unread)));
+            tx.appendChild(nm); tx.appendChild(lm);
+            row.appendChild(av); row.appendChild(tx); row.appendChild(rt);
+            row.addEventListener('click', () => openThread(th.student_id, th.fullname));
+            threadsEl.appendChild(row);
+          });
+          [...threadsEl.children].forEach(ch => { ch.style.background = (Number(ch.dataset.sid) === Number(activeSid)) ? '#e2e8f0' : ''; });
+        } catch (e) { console.error('threads err', e); }
+      }
+
+      async function openThread(studentId, fullname) {
+        activeSid = studentId;
+        lastMsgId = 0;
+        msgList.innerHTML = '';
+        const hdr = inbox.querySelector('.title');
+        if (hdr) hdr.textContent = `RGO Inbox — ${fullname || ('Student #' + studentId)}`;
+        if (pollMsgs) { clearInterval(pollMsgs); pollMsgs = null; }
+        await fetchMsgs(true);
+        pollMsgs = setInterval(fetchMsgs, POLL);
+        [...threadsEl.children].forEach(ch => { ch.style.background = (Number(ch.dataset.sid) === Number(activeSid)) ? '#e2e8f0' : ''; });
+      }
+
+      async function fetchMsgs(initial = false) {
+        if (!activeSid) return;
+        try {
+          // admin view – pulls BOTH student & admin from the same table
+          const url = new URL(location.href);
+          url.searchParams.set('action', 'chat_fetch_admin');
+          url.searchParams.set('student_id', String(activeSid));
+          url.searchParams.set('since_id', initial ? '0' : String(lastMsgId || 0));
+          const res = await fetch(url.toString());
+          const data = await res.json();
+          if (!data.ok) return;
+
+          (data.messages || []).forEach(m => {
+            const sender = (m.sender === 'admin') ? 'admin' : 'student'; // anything not 'admin' => student
+            addBubble(sender, m.message);
+            if (!lastMsgId || m.id > lastMsgId) lastMsgId = m.id;
+          });
+
+          if (initial) scrollToBottom(); else if ((data.messages || []).length) scrollToBottom();
+        } catch (e) { console.error('fetchMsgs err', e); }
+      }
+
+      async function sendMsg() {
+        const text = (input.value || '').trim();
+        if (!text || !activeSid) return;
+        sendBtn.disabled = true;
+        try {
+          const fd = new FormData();
+          fd.append('action', 'chat_send_admin');
+          fd.append('student_id', String(activeSid));
+          fd.append('message', text);
+          const res = await fetch(location.pathname.split('/').pop(), { method: 'POST', body: fd });
+          const data = await res.json();
+          if (data.ok) {
+            addBubble('admin', text);
+            input.value = '';
+            lastMsgId = Math.max(lastMsgId, data.message?.id || lastMsgId);
+            scrollToBottom();
+            refreshThreads(); // clear unread & update preview
+          } else {
+            alert(data.msg || 'Failed to send.');
+          }
+        } catch (e) {
+          console.error('send err', e);
+          alert('Network error.');
+        } finally {
+          sendBtn.disabled = false;
+          input.focus();
+        }
+      }
+
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendMsg(); } });
+      sendBtn.addEventListener('click', sendMsg);
+
+      // Optional: open inbox automatically if query ?open=inbox
+      try { const q = new URLSearchParams(location.search); if (q.get('open') === 'inbox') openInbox(); } catch { }
+    })();
+
+    (function () {
+      // Re-select safely (doesn't rely on earlier JS scope)
+      const inbox = document.querySelector('.rgo-inbox');
+      const msgWrap = document.getElementById('rgoMsgList');
+
+      if (!inbox || !msgWrap) return;
+
+      // Ensure the pane always has a height to scroll within
+      function sizePane() {
+        // Parent (.rgo-msgs) has full height; .rgo-msg-list flexes inside it.
+        // Force a numeric height so some browsers render the scrollbar reliably.
+        const msgs = msgWrap.closest('.rgo-msgs');
+        if (!msgs) return;
+        const rect = msgs.getBoundingClientRect();
+        // subtract input area height (~60-72px). We’ll measure it precisely if available.
+        const input = msgs.querySelector('.rgo-input');
+        const pad = 0;
+        const h = rect.height - (input ? input.getBoundingClientRect().height : 70) - pad;
+        if (h > 120) msgWrap.style.maxHeight = h + 'px';
+      }
+
+      // Smoothly jump to bottom when needed (only when already near bottom)
+      function scrollToBottom(force = false) {
+        if (!msgWrap) return;
+        const nearBottom = (msgWrap.scrollHeight - (msgWrap.scrollTop + msgWrap.clientHeight)) < 80;
+        if (force || nearBottom) {
+          msgWrap.scrollTo({ top: msgWrap.scrollHeight, behavior: 'smooth' });
+        }
+      }
+
+      // Try to scroll to bottom when the inbox opens (observer watches display change)
+      const obs = new MutationObserver(() => {
+        if (getComputedStyle(inbox).display !== 'none') {
+          sizePane();
+          // slight delay so layout settles
+          setTimeout(() => scrollToBottom(true), 60);
+        }
+      });
+      obs.observe(inbox, { attributes: true, attributeFilter: ['style', 'class'] });
+
+      // Resize handling
+      window.addEventListener('resize', sizePane);
+
+      // When new bubbles are appended by your existing code, they change scrollHeight.
+      // Observe children to auto-size and keep you at bottom if you were already there.
+      const childObs = new MutationObserver(() => { sizePane(); scrollToBottom(false); });
+      childObs.observe(msgWrap, { childList: true, subtree: false });
+
+      // Improve wheel/touch behavior inside the pane so it doesn't “trap” the page
+      msgWrap.addEventListener('wheel', (e) => {
+        const atTop = msgWrap.scrollTop === 0 && e.deltaY < 0;
+        const atBottom = Math.ceil(msgWrap.scrollTop + msgWrap.clientHeight) >= msgWrap.scrollHeight && e.deltaY > 0;
+        if (atTop || atBottom) e.stopPropagation();
+      }, { passive: true });
+
+      // Initial pass (in case it starts opened via ?open=inbox)
+      sizePane();
+      setTimeout(() => scrollToBottom(true), 100);
+    })();
+
+    (function () {
+      // 1) Mark & hide the original Notifications button (keep for programmatic click)
+      const notifBtn = Array.from(document.querySelectorAll('.sidebar .sidebar-btn'))
+        .find(b => /notifications/i.test(b?.textContent || ''));
+      if (notifBtn) {
+        notifBtn.dataset.rgoNotifs = '1';
+        notifBtn.style.display = 'none';
+      }
+
+      // 2) Add floating Messenger FAB that opens the inbox by "clicking" the hidden button
+      const fab = document.createElement('button');
+      fab.className = 'rgo-fab';
+      fab.setAttribute('aria-label', 'Open chats');
+      fab.innerHTML = '💬';
+      fab.addEventListener('click', () => {
+        // If inbox already in DOM, just show it by triggering the same code path:
+        if (notifBtn) notifBtn.click();
+        else {
+          // Fallback: if the inbox exists but is hidden, show it
+          const box = document.querySelector('.rgo-inbox');
+          if (box) { box.style.display = 'block'; }
+        }
+      });
+      document.body.appendChild(fab);
+
+      // 3) Decorate the threads list to look/behave like Facebook recents
+      const threads = document.getElementById('rgoThreads');
+
+      // Build (or rebuild) the search header and move rows into a list container
+      function decorateThreads() {
+        if (!threads) return;
+
+        // Create head if missing
+        let head = threads.querySelector('.rgo-recents-head');
+        if (!head) {
+          head = document.createElement('div');
+          head.className = 'rgo-recents-head';
+          head.innerHTML = `
+        <div class="rgo-search">
+          <span style="font-size:14px;opacity:.7">🔎</span>
+          <input id="rgoSearchInput" type="text" placeholder="Search chats">
+        </div>
+      `;
+          // Insert at top
+          threads.prepend(head);
+        }
+
+        // Ensure there is a container to hold only rows
+        let list = threads.querySelector('.rgo-thread-list');
+        if (!list) {
+          list = document.createElement('div');
+          list.className = 'rgo-thread-list';
+          // Move any existing rows into the list
+          Array.from(threads.querySelectorAll('.rgo-thread')).forEach(r => list.appendChild(r));
+          head.insertAdjacentElement('afterend', list);
+        } else {
+          // If rows were re-rendered directly under threads, move them back into the list
+          Array.from(threads.children).forEach(ch => {
+            if (ch !== head && ch !== list) {
+              // likely newly rendered row
+              if (ch.classList?.contains('rgo-thread')) list.appendChild(ch);
+            }
+          });
+        }
+
+        // Unread badge → add .unread and a blue dot (FB-like)
+        list.querySelectorAll('.rgo-thread').forEach(row => {
+          const hasUnread = !!row.querySelector('.badge') && Number(row.querySelector('.badge')?.textContent || 0) > 0;
+          row.classList.toggle('unread', hasUnread);
+          // Add dot once
+          if (hasUnread && !row.querySelector('.dot')) {
+            const dot = document.createElement('div'); dot.className = 'dot';
+            // put dot at the far right in the right-time container, or create one
+            const rightCell = row.querySelector('.time')?.parentElement || row;
+            rightCell.appendChild(dot);
+          }
+        });
+
+        // Search filtering
+        const input = head.querySelector('#rgoSearchInput');
+        if (input && !input._wired) {
+          input._wired = true;
+          input.addEventListener('input', () => {
+            const q = (input.value || '').toLowerCase().trim();
+            list.querySelectorAll('.rgo-thread').forEach(row => {
+              const text = row.textContent.toLowerCase();
+              row.style.display = text.includes(q) ? '' : 'none';
+            });
+          });
+        }
+      }
+
+      // Observe changes to the threads container; the original script re-renders rows
+      const obs = new MutationObserver(() => {
+        // Run after the original code updates the list
+        requestAnimationFrame(decorateThreads);
+      });
+      if (threads) obs.observe(threads, { childList: true, subtree: false });
+
+      // If inbox loads later, try again
+      const bodyObs = new MutationObserver(() => {
+        const t = document.getElementById('rgoThreads');
+        if (t && t !== threads) {
+          obs.disconnect();
+          setTimeout(() => {
+            decorateThreads();
+            obs.observe(t, { childList: true, subtree: false });
+          }, 50);
+          bodyObs.disconnect();
+        }
+      });
+      bodyObs.observe(document.body, { childList: true, subtree: true });
+
+      // If the inbox is already open, decorate immediately
+      setTimeout(decorateThreads, 200);
+    })();
+
+
+    // Open Add Student Panel
+    document.getElementById("openAddStudent").onclick = () => {
+      document.getElementById("panelAddStudent").classList.add("show");
+    };
+
+    // Open Add Admin Panel
+    document.getElementById("openAddAdmin").onclick = () => {
+      document.getElementById("panelAddAdmin").classList.add("show");
+    };
+
+    setInterval(() => {
+      fetch("heartbeat.php");
+    }, 30000);
+
+
+    const signoutBtn = document.getElementById("signoutBtn");
+    signoutBtn.addEventListener("click", () => {
+      const c = confirm("Are you sure you want to sign out?");
+      if (c) window.location.href = "logout_admin.php";
+    });
+  </script>
+
+
 </body>
 
 </html>

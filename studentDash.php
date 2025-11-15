@@ -16,6 +16,90 @@ $STATIC_QR_IMAGES = [
     'qr-3.jpg',
 ];
 
+try {
+    // Create chat_messages table if missing (safe to run repeatedly)
+    @$conn->query("CREATE TABLE IF NOT EXISTS chat_messages (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        student_id INT NOT NULL,
+        sender ENUM('student','admin') NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX (student_id),
+        INDEX (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+} catch (Throwable $e) {
+    error_log('CHAT CREATE TABLE ERR: ' . $e->getMessage());
+}
+
+// Send a chat message (from student)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'chat_send') {
+    header('Content-Type: application/json');
+    $sid = isset($_SESSION['student_id']) ? (int)$_SESSION['student_id'] : 0;
+    if ($sid <= 0) {
+        echo json_encode(['ok' => false, 'msg' => 'Not logged in.']);
+        exit;
+    }
+    $msg = trim($_POST['message'] ?? '');
+    if ($msg === '') {
+        echo json_encode(['ok' => false, 'msg' => 'Message cannot be empty.']);
+        exit;
+    }
+    try {
+        $stmt = $conn->prepare("INSERT INTO chat_messages (student_id, sender, message) VALUES (?, 'student', ?)");
+        $stmt->bind_param('is', $sid, $msg);
+        $stmt->execute();
+        $newId = $stmt->insert_id;
+        $stmt->close();
+        echo json_encode(['ok' => true, 'message' => ['id'=>$newId, 'sender'=>'student', 'message'=>$msg]]);
+    } catch (Throwable $e) {
+        error_log('CHAT SEND ERR: ' . $e->getMessage());
+        echo json_encode(['ok' => false, 'msg' => 'Failed to send.']);
+    }
+    exit;
+}
+
+// Fetch chat messages (for this student)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'chat_fetch') {
+    header('Content-Type: application/json');
+    $sid = isset($_SESSION['student_id']) ? (int)$_SESSION['student_id'] : 0;
+    if ($sid <= 0) {
+        echo json_encode(['ok' => false, 'msg' => 'Not logged in.']);
+        exit;
+    }
+    $since_id = isset($_POST['since_id']) ? (int)$_POST['since_id'] : 0;
+    try {
+        if ($since_id > 0) {
+            $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                                    FROM chat_messages
+                                    WHERE student_id = ? AND id > ?
+                                    ORDER BY id ASC
+                                    LIMIT 200");
+            $stmt->bind_param('ii', $sid, $since_id);
+        } else {
+            $stmt = $conn->prepare("SELECT id, sender, message, created_at
+                                    FROM chat_messages
+                                    WHERE student_id = ?
+                                    ORDER BY id DESC
+                                    LIMIT 50");
+            $stmt->bind_param('i', $sid);
+        }
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $rows = [];
+        while ($r = $res->fetch_assoc()) { $rows[] = $r; }
+        $stmt->close();
+
+        if ($since_id === 0) { $rows = array_reverse($rows); }
+        echo json_encode(['ok' => true, 'messages' => $rows]);
+    } catch (Throwable $e) {
+        error_log('CHAT FETCH ERR: ' . $e->getMessage());
+        echo json_encode(['ok' => false, 'msg' => 'Failed to fetch.']);
+    }
+    exit;
+}
+/* ============== END ADD ============== */
+
+
 function sendHttpSms($apiKey, $from, $to, $message)
 {
     $url = "https://api.httpsms.com/v1/messages/send";
@@ -58,11 +142,7 @@ function sendHttpSms($apiKey, $from, $to, $message)
     return ['http_code' => $code, 'error' => $err, 'body' => $resp];
 }
 
-/* =======================
-   ADDED: secure numeric ID helpers + atomic insert
-   ======================= */
 
-/** Generate a cryptographically secure numeric string of exact length $len. */
 function gen_digits($len) {
     $out = '';
     for ($i = 0; $i < $len; $i++) {
@@ -71,15 +151,7 @@ function gen_digits($len) {
     return $out;
 }
 
-/**
- * Create order + payment ATOMICALLY.
- * - order_num: 32 digits
- * - transaction_num: 64 digits
- * - payment_no: 32 digits
- * Falls back to latest login_id for the student if not in session.
- *
- * Returns array: ['ok'=>bool, 'order_id'=>int|null, 'payment_id'=>int|null, 'msg'=>string|null]
- */
+
 function create_order_and_payment(mysqli $conn, int $student_id, ?int $item_id, float $amount, string $method = 'gcash', string $currency = 'PHP', ?string $notes = null) {
     // Resolve login_id
     $login_id = isset($_SESSION['login_id']) ? (int)$_SESSION['login_id'] : 0;
@@ -166,9 +238,7 @@ function create_order_and_payment(mysqli $conn, int $student_id, ?int $item_id, 
         return ['ok'=>false, 'order_id'=>null, 'payment_id'=>null, 'msg'=>$e->getMessage()];
     }
 }
-/* =======================
-   END additions
-   ======================= */
+
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'send_otp') {
     header('Content-Type: application/json');
@@ -242,7 +312,7 @@ Your verification code is: {$boldOtp}. It will expire in 5 minutes.";
     if (!empty($resp['error'])) {
         echo json_encode([
             'ok' => false,
-            'msg' => 'Failed to send OTP. Network error.',
+            'msg' => 'Failed to send OTP. Network error. Please try again.',
             'debug' => [
                 'http_code' => $resp['http_code'],
                 'curl_error' => $resp['error'],
@@ -314,11 +384,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     // OTP correct — clear OTP values
     unset($_SESSION['gcash_otp'], $_SESSION['gcash_otp_expiry']);
 
-    /* ===========================================
-       ADDED: Create the order + payment AT THIS POINT (atomic)
-       We’ll accept optional POST values if you wire them later (item_id, amount, notes).
-       Otherwise defaults are safe (NULL item, 0.00 amount).
-       =========================================== */
     $student_id_for_tx = isset($_SESSION['student_id']) ? (int)$_SESSION['student_id'] : 0;
 
     // Best-effort: ensure we have a login_id in session (fallback to latest for this student)
@@ -345,8 +410,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         $insertResult = create_order_and_payment($conn, $student_id_for_tx, $item_id, $amount, 'gcash', 'PHP', $notes);
     }
 
-    // If you prefer to block QR on DB failure, you can check $insertResult['ok'] first.
-    // Here we keep your existing behavior (always show QR on successful OTP), but we include debug info.
     if (!$insertResult['ok']) {
         error_log("CREATE ORDER+PAYMENT FAILED: ".$insertResult['msg']);
     }
@@ -357,7 +420,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
         echo json_encode([
             'ok' => true,
             'qr' => [$selectedQr],
-            // Optional info for debugging; frontend can ignore
             'order_payment' => $insertResult
         ]);
         exit;
@@ -374,7 +436,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
     echo json_encode([
         'ok' => true,
         'qr' => $qrUrls,
-        // Optional info for debugging; frontend can ignore
         'order_payment' => $insertResult
     ]);
     exit;
@@ -508,8 +569,7 @@ if ($items_rs) {
     <!-- ✅ Added: Latest Bootstrap CSS (CDN) -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@latest/dist/css/bootstrap.min.css" rel="stylesheet"
         crossorigin="anonymous" />
-
-    <style>
+        <style>
         html,
         body {
             margin: 0;
@@ -953,7 +1013,7 @@ if ($items_rs) {
         }
 
         .btn-ghost {
-            background: red;
+            background: white;
             border: 1px solid #ddd;
             border-radius: 8px;
             padding: 10px 14px;
@@ -1292,7 +1352,6 @@ if ($items_rs) {
             justify-items: center !important;
         }
 
-        /* >>> CHANGED THIS BLOCK ONLY: make QR image small <<< */
         #qrModal .qr-wrap img {
             width: 400px !important;
             height: 250px !important;
@@ -1404,7 +1463,6 @@ if ($items_rs) {
 
     <!-- ✅ OVERRIDES (no removal of existing code): Make product cards fill the row and OTP into 6 boxes -->
     <style>
-        /* Make the product grid consume full row width with responsive columns that fill each line */
         .product-grid {
             display: grid !important;
             grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)) !important;
@@ -1424,7 +1482,6 @@ if ($items_rs) {
             height: 260px !important;
         }
 
-        /* OTP 6-box UI */
         .otp-boxes {
             display: flex;
             gap: 10px;
@@ -1448,7 +1505,6 @@ if ($items_rs) {
             box-shadow: 0 0 0 2px rgba(238, 77, 45, 0.15);
         }
 
-        /* Hide original single OTP input, we’ll sync its value */
         #otpCode {
             position: absolute !important;
             opacity: 0 !important;
@@ -1460,12 +1516,10 @@ if ($items_rs) {
 
     <!-- ✅ NEW: Pure CSS polish (no HTML/JS changes) -->
     <style>
-        /* PERSONAL INFORMATION MODAL — formal look */
         .modal {
             position: fixed;
             inset: 0;
             display: none;
-            /* JS sets to block */
             background: rgba(17, 24, 39, 0.55);
             z-index: 4000;
             overflow: auto;
@@ -1479,7 +1533,6 @@ if ($items_rs) {
             border: 1px solid #e5e7eb;
             box-shadow: 0 24px 60px rgba(0, 0, 0, .22);
             margin: 6vh auto 4vh;
-            /* centers horizontally; comfortable top space */
             padding: 24px 26px 22px;
             position: relative;
             animation: pfFadeUp .22s ease-out;
@@ -1586,7 +1639,6 @@ if ($items_rs) {
             background: #d63f22;
         }
 
-        /* CATEGORY FILTER — more refined look (no JS needed) */
         .category-bar {
             gap: 10px;
         }
@@ -1597,9 +1649,7 @@ if ($items_rs) {
 
         .category {
             padding: 9px 16px;
-            /* slightly larger click target */
             border-radius: 999px;
-            /* pill */
             letter-spacing: .2px;
             backdrop-filter: saturate(1.2);
             box-shadow: 0 1px 0 rgba(255, 255, 255, .2) inset;
@@ -1613,6 +1663,76 @@ if ($items_rs) {
         .category:focus-visible {
             outline: 3px solid rgba(255, 255, 255, .65);
             outline-offset: 2px;
+        }
+    </style>
+
+    <!-- ✅ NEW: CART STYLES -->
+    <style>
+        .cart-btn {
+            margin-left: 8px;
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 50%;
+            width: 38px;
+            height: 38px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .cart-count {
+            position: absolute;
+            top: -4px;
+            right: -4px;
+            background: #ee4d2d;
+            color: #fff;
+            border-radius: 999px;
+            font-size: 11px;
+            padding: 1px 5px;
+            min-width: 16px;
+            text-align: center;
+            display: none;
+        }
+
+        .cart-item {
+            display: grid;
+            grid-template-columns: 64px 1fr auto;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .cart-item img {
+            width: 64px;
+            height: 64px;
+            border-radius: 8px;
+            object-fit: cover;
+        }
+
+        .cart-item-name {
+            font-weight: 600;
+        }
+
+        .cart-item-meta {
+            font-size: 13px;
+            color: #666;
+        }
+
+        .cart-remove {
+            background: transparent;
+            border: none;
+            color: #d63f22;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        .cart-empty {
+            color: #666;
+            font-size: 13px;
         }
     </style>
 </head>
@@ -1653,6 +1773,11 @@ if ($items_rs) {
         </div>
         <div class="right-controls">
             <input type="text" id="searchInput" class="search-box" placeholder="Search products..." />
+            <!-- 🛒 Cart icon button -->
+            <button type="button" id="cartToggleBtn" class="cart-btn" title="View cart">
+                🛒
+                <span id="cartCount" class="cart-count">0</span>
+            </button>
         </div>
     </nav>
 
@@ -1664,11 +1789,14 @@ if ($items_rs) {
                     $imagesAttr = implode(', ', $it['images']);
                     $desc = trim($it['desc']) !== '' ? $it['desc'] : 'This item is presented with a formal description.';
                     ?>
-                    <div class="product-card" data-category="<?= htmlspecialchars($it['category']) ?>"
+                    <div class="product-card"
+                        data-category="<?= htmlspecialchars($it['category']) ?>"
                         data-name="<?= htmlspecialchars($it['name']) ?>"
                         data-price="<?= htmlspecialchars($it['price_display']) ?>"
-                        data-images="<?= htmlspecialchars($imagesAttr) ?>" data-description="<?= htmlspecialchars($desc) ?>"
-                        data-sizes="<?= htmlspecialchars($it['sizes_attr']) ?>">
+                        data-images="<?= htmlspecialchars($imagesAttr) ?>"
+                        data-description="<?= htmlspecialchars($desc) ?>"
+                        data-sizes="<?= htmlspecialchars($it['sizes_attr']) ?>"
+                        data-item-id="<?= htmlspecialchars($it['item_id']) ?>">
                         <img src="<?= htmlspecialchars($firstImg) ?>" alt="<?= htmlspecialchars($it['name']) ?>"
                             class="product-img" />
                         <h3 class="product-name"><?= htmlspecialchars($it['name']) ?></h3>
@@ -1710,7 +1838,9 @@ if ($items_rs) {
                     <div id="pdPrice" class="pd-price">₱0.00</div>
                     <p id="pdDesc" class="pd-desc">This item is presented with a formal description.</p>
                     <div class="pd-actions">
-                        <button style="color: white;" id="pdBuyNow" class="btn-ghost">Buy now</button>
+                        <!-- 🛒 Add to Cart icon -->
+                        <button id="pdAddToCart" class="btn-ghost" title="Add to cart">🛒</button>
+                        <button style="color: white;" id="pdBuyNow" class="btn-primary">Buy now</button>
                     </div>
                 </div>
             </div>
@@ -1729,7 +1859,7 @@ if ($items_rs) {
             </div>
             <div class="buy-actions">
                 <button style="background-color: transparent;" id="buyCancel" class="btn-ghost">Cancel</button>
-                <button id="buyProceed" class="btn-primary" disabled>Proceed to Checkout</button>
+                <button id="buyProceed" class="btn-primary" disabled>Checkout</button>
             </div>
         </div>
     </div>
@@ -1821,13 +1951,8 @@ if ($items_rs) {
             </div>
             <div class="simple-body">
                 <p id="otpSentMsg" style="margin-top:0;"></p>
-
-                <!-- Original single input (kept, hidden by CSS); value will be synced from 6 boxes -->
                 <input type="text" id="otpCode" maxlength="6" class="text-input" placeholder="------" />
-
-                <!-- Container for the 6 OTP boxes (created by JS if not present) -->
                 <div id="otpBoxesMount"></div>
-
                 <div id="otpStatus" style="margin-top:10px;font-size:13px;color:#d63f22;"></div>
             </div>
             <div class="simple-actions">
@@ -1849,6 +1974,24 @@ if ($items_rs) {
             </div>
             <div class="simple-actions">
                 <button id="qrDone" class="btn-primary">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 🛒 CART MODAL -->
+    <div id="cartModal" class="simple-modal" aria-hidden="true">
+        <div class="simple-panel" role="dialog" aria-modal="true" aria-labelledby="cartTitle">
+            <div class="simple-header">
+                <h3 id="cartTitle" class="buy-title">My Cart</h3>
+                <button id="cartClose" class="ck-close" aria-label="Close">×</button>
+            </div>
+            <div class="simple-body">
+                <div id="cartEmptyText" class="cart-empty">Your cart is empty.</div>
+                <div id="cartItems"></div>
+            </div>
+            <div class="simple-actions">
+                <button id="cartClear" class="btn-ghost" style="background-color: transparent;">Clear</button>
+                <button id="cartCheckout" class="btn-primary">Checkout</button>
             </div>
         </div>
     </div>
@@ -1908,17 +2051,21 @@ if ($items_rs) {
         const pdPrice = document.getElementById('pdPrice');
         const pdDesc = document.getElementById('pdDesc');
         const pdBuyNow = document.getElementById('pdBuyNow');
+        const pdAddToCart = document.getElementById('pdAddToCart');
 
         const cTrack = document.getElementById('cTrack');
-        theDots = document.getElementById('cDots');
+        const cDots = document.getElementById('cDots');
         const cPrev = document.getElementById('cPrev');
         const cNext = document.getElementById('cNext');
 
         let cIndex = 0, cImages = [];
         let currentProductName = '', currentProductPrice = '', currentProductImage = '', currentDescription = '';
         let currentSizes = [], selectedSize = '', selectedStock = 0;
+        let currentItemId = null;
+        let currentBuyMode = 'buynow';
+        let cart = [];
 
-        function openProductDetail({ name, price, images, description, sizes }) {
+        function openProductDetail({ id, name, price, images, description, sizes }) {
             pdTitle.textContent = name;
             pdName.textContent = name;
             pdPrice.textContent = price;
@@ -1926,10 +2073,12 @@ if ($items_rs) {
             currentProductName = name;
             currentProductPrice = price;
             currentDescription = pdDesc.textContent;
+            currentItemId = id || null;
             cImages = images && images.length ? images : [];
             currentProductImage = cImages[0] || '';
             currentSizes = sizes || [];
             selectedSize = ''; selectedStock = 0;
+
             cTrack.innerHTML = '';
             cDots.innerHTML = '';
             cIndex = 0;
@@ -1992,7 +2141,8 @@ if ($items_rs) {
             });
         }
 
-        function openBuyModal() {
+        function openBuyModal(mode) {
+            currentBuyMode = mode || 'buynow';
             sizeList.innerHTML = '';
             selectedSize = ''; selectedStock = 0;
             buyProceed.disabled = true;
@@ -2010,11 +2160,6 @@ if ($items_rs) {
             buyModal.classList.add('show'); buyModal.setAttribute('aria-hidden', 'false');
         }
         function closeBuyModal() { buyModal.classList.remove('show'); buyModal.setAttribute('aria-hidden', 'true'); }
-
-        pdBuyNow.addEventListener('click', openBuyModal);
-        buyClose.addEventListener('click', closeBuyModal);
-        buyCancel.addEventListener('click', closeBuyModal);
-        buyModal.addEventListener('click', (e) => { if (e.target === buyModal) closeBuyModal(); });
 
         const ckModal = document.getElementById('checkoutModal');
         const ckClose = document.getElementById('ckClose');
@@ -2035,8 +2180,34 @@ if ($items_rs) {
         ckClose.addEventListener('click', closeCheckout);
         ckModal.addEventListener('click', (e) => { if (e.target === ckModal) closeCheckout(); });
 
+        function addCurrentSelectionToCart() {
+            if (!currentProductName || !selectedSize) return;
+            cart.push({
+                id: currentItemId || null,
+                name: currentProductName,
+                size: selectedSize,
+                price: currentProductPrice,
+                image: currentProductImage
+            });
+            updateCartBadge();
+        }
+
+        pdBuyNow.addEventListener('click', () => openBuyModal('buynow'));
+        if (pdAddToCart) {
+            pdAddToCart.addEventListener('click', () => openBuyModal('cart'));
+        }
+        buyClose.addEventListener('click', closeBuyModal);
+        buyCancel.addEventListener('click', closeBuyModal);
+        buyModal.addEventListener('click', (e) => { if (e.target === buyModal) closeBuyModal(); });
+
         buyProceed.addEventListener('click', () => {
             if (!selectedSize) return;
+            if (currentBuyMode === 'cart') {
+                addCurrentSelectionToCart();
+                closeBuyModal();
+                alert('Added to cart.');
+                return;
+            }
             closeBuyModal(); closeProductDetail(); openCheckout();
         });
 
@@ -2060,6 +2231,16 @@ if ($items_rs) {
         const qrDone = document.getElementById('qrDone');
         const qrWrap = document.getElementById('qrWrap');
 
+        // 🛒 Cart elements
+        const cartModal = document.getElementById('cartModal');
+        const cartClose = document.getElementById('cartClose');
+        const cartClear = document.getElementById('cartClear');
+        const cartCheckout = document.getElementById('cartCheckout');
+        const cartItems = document.getElementById('cartItems');
+        const cartEmptyText = document.getElementById('cartEmptyText');
+        const cartToggleBtn = document.getElementById('cartToggleBtn');
+        const cartCountSpan = document.getElementById('cartCount');
+
         function show(el) { el.classList.add('show'); el.setAttribute('aria-hidden', 'false'); }
         function hide(el) { el.classList.remove('show'); el.setAttribute('aria-hidden', 'true'); }
 
@@ -2071,6 +2252,79 @@ if ($items_rs) {
 
         qrClose.addEventListener('click', () => hide(qrModal));
         qrDone.addEventListener('click', () => hide(qrModal));
+
+        function updateCartBadge() {
+            if (!cartCountSpan) return;
+            const count = cart.length;
+            cartCountSpan.textContent = count;
+            cartCountSpan.style.display = count > 0 ? 'inline-block' : 'none';
+        }
+
+        function renderCart() {
+            if (!cartItems) return;
+            cartItems.innerHTML = '';
+            if (!cart.length) {
+                cartEmptyText.style.display = 'block';
+                return;
+            }
+            cartEmptyText.style.display = 'none';
+            cart.forEach((item, index) => {
+                const row = document.createElement('div');
+                row.className = 'cart-item';
+                const img = document.createElement('img');
+                img.src = item.image || 'logo.png';
+                img.alt = item.name || 'Item';
+
+                const mid = document.createElement('div');
+                const name = document.createElement('div');
+                name.className = 'cart-item-name';
+                name.textContent = item.name || '';
+                const meta = document.createElement('div');
+                meta.className = 'cart-item-meta';
+                meta.textContent = (item.size ? `Size: ${item.size} · ` : '') + (item.price || '');
+                mid.appendChild(name);
+                mid.appendChild(meta);
+
+                const rm = document.createElement('button');
+                rm.className = 'cart-remove';
+                rm.textContent = 'Remove';
+                rm.addEventListener('click', () => {
+                    cart.splice(index, 1);
+                    renderCart();
+                    updateCartBadge();
+                });
+
+                row.appendChild(img);
+                row.appendChild(mid);
+                row.appendChild(rm);
+                cartItems.appendChild(row);
+            });
+        }
+
+        if (cartToggleBtn) {
+            cartToggleBtn.addEventListener('click', () => {
+                renderCart();
+                show(cartModal);
+            });
+        }
+        cartClose.addEventListener('click', () => hide(cartModal));
+        cartModal.addEventListener('click', (e) => { if (e.target === cartModal) hide(cartModal); });
+        cartClear.addEventListener('click', () => {
+            cart = [];
+            renderCart();
+            updateCartBadge();
+        });
+        cartCheckout.addEventListener('click', () => {
+            if (!cart.length) return;
+            const first = cart[0];
+            currentItemId = first.id || null;
+            currentProductName = first.name;
+            currentProductPrice = first.price;
+            currentProductImage = first.image;
+            selectedSize = first.size;
+            hide(cartModal);
+            openCheckout();
+        });
 
         const ckPayRadios = document.querySelectorAll('input[name="paymethod"]');
         const ckPlaceOrderBtn = document.getElementById('ckPlaceOrder');
@@ -2102,7 +2356,6 @@ if ($items_rs) {
                         strong.textContent = '(' + STUDENT_PHONE_E164 + ')';
                         otpSentMsg.appendChild(strong);
                         show(otpModal);
-                        // Clear 6-box UI if present
                         if (window.__otpInputs) window.__otpInputs.forEach(i => i.value = '');
                         if (window.__otpInputs && window.__otpInputs[0]) window.__otpInputs[0].focus();
                     } else {
@@ -2168,7 +2421,6 @@ if ($items_rs) {
                 const form = new FormData();
                 form.append('action', 'verify_otp');
                 form.append('code', code);
-                // Optional: later you can also send item_id/amount/notes here
                 const res = await fetch(window.location.href, { method: 'POST', body: form });
                 const data = await res.json();
                 if (data.ok) {
@@ -2207,13 +2459,14 @@ if ($items_rs) {
                 const attr = card.getAttribute('data-images') || '';
                 const desc = card.getAttribute('data-description') || '';
                 const sizesA = card.getAttribute('data-sizes') || '';
+                const itemId = card.getAttribute('data-item-id') || '';
                 let images = attr.split(', ').map(s => s.trim()).filter(Boolean);
                 if (images.length === 0) {
                     const single = card.querySelector('.product-img')?.getAttribute('src') || '';
                     if (single) images = [single, single, single, single];
                 }
                 const sizes = parseSizes(sizesA);
-                openProductDetail({ name, price, images, description: desc, sizes });
+                openProductDetail({ id: itemId, name, price, images, description: desc, sizes });
             });
         });
 
@@ -2344,13 +2597,11 @@ if ($items_rs) {
 
         backToShop.addEventListener('click', hideOrders);
 
-        /* ===== OTP 6-BOX ENHANCEMENT (non-breaking) ===== */
         (function initOtpBoxes() {
             const mount = document.getElementById('otpBoxesMount');
             const hidden = document.getElementById('otpCode');
             if (!mount || !hidden) return;
 
-            // Build 6 inputs
             const wrap = document.createElement('div');
             wrap.className = 'otp-boxes';
             const inputs = [];
@@ -2367,7 +2618,6 @@ if ($items_rs) {
             mount.appendChild(wrap);
             window.__otpInputs = inputs;
 
-            // Helpers
             function syncHidden() {
                 hidden.value = inputs.map(x => (x.value || '').replace(/\D/g, '')).join('').slice(0, 6);
             }
@@ -2406,7 +2656,6 @@ if ($items_rs) {
                 });
             });
 
-            // Keep boxes in sync if code set programmatically
             const observer = new MutationObserver(() => {
                 const v = (hidden.value || '').replace(/\D/g, '').slice(0, 6);
                 for (let i = 0; i < inputs.length; i++) {
@@ -2415,7 +2664,6 @@ if ($items_rs) {
             });
             observer.observe(hidden, { attributes: true, attributeFilter: ['value'] });
 
-            // Autofocus first box when modal opens
             const otpModal = document.getElementById('otpModal');
             const obs = new MutationObserver(() => {
                 const shown = otpModal.classList.contains('show');
@@ -2423,12 +2671,138 @@ if ($items_rs) {
             });
             obs.observe(otpModal, { attributes: true, attributeFilter: ['class'] });
         })();
-        /* ===== END OTP 6-BOX ENHANCEMENT ===== */
     </script>
 
-    <!-- ✅ Added: Latest Bootstrap JS Bundle (includes Popper) -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@latest/dist/js/bootstrap.bundle.min.js"
         crossorigin="anonymous"></script>
+
+    <script>
+    (function () {
+        const css = `
+        .rgochat-wrap{position:fixed;right:18px;bottom:18px;width:340px;max-width:calc(100vw - 32px);height:480px;max-height:calc(100vh - 32px);background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 18px 40px rgba(0,0,0,.18);display:none;z-index:5000;overflow:hidden}
+        .rgochat-hdr{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#ee4d2d;color:#fff}
+        .rgochat-title{font-weight:800;margin:0;font-size:15px}
+        .rgochat-x{border:none;background:rgba(255,255,255,.18);color:#fff;font-size:18px;line-height:1;width:28px;height:28px;border-radius:8px;cursor:pointer}
+        .rgochat-body{background:#fafafa;height:calc(100% - 52px - 62px);overflow:auto;padding:12px}
+        .rgochat-empty{text-align:center;color:#666;font-size:13px;margin-top:20px}
+        .rgochat-msg{max-width:80%;padding:8px 10px;border-radius:12px;margin:6px 0;font-size:14px;line-height:1.35;word-wrap:break-word;white-space:pre-wrap}
+        .rgochat-me{background:#e6f2ff;color:#0b5394;margin-left:auto;border-top-right-radius:4px}
+        .rgochat-admin{background:#fff;border:1px solid #eee;color:#111827;border-top-left-radius:4px}
+        .rgochat-ftr{display:grid;grid-template-columns:1fr 72px;gap:8px;padding:10px;background:#fff;border-top:1px solid #eee}
+        .rgochat-in{border:1px solid #e5e7eb;border-radius:10px;padding:10px 12px;font-size:14px;outline:none}
+        .rgochat-send{background:#ee4d2d;color:#fff;border:none;border-radius:10px;font-weight:800;cursor:pointer}
+        .rgochat-send:disabled{opacity:.5;cursor:not-allowed}
+        `;
+        const st = document.createElement('style'); st.textContent = css; document.head.appendChild(st);
+
+        const box = document.createElement('div');
+        box.className = 'rgochat-wrap';
+        box.innerHTML = `
+            <div class="rgochat-hdr">
+                <div class="rgochat-title">Chat with RGO</div>
+                <button class="rgochat-x" title="Close">×</button>
+            </div>
+            <div class="rgochat-body" id="rgochat-body">
+                <div class="rgochat-empty" id="rgochat-empty">Start a conversation with the RGO admin.</div>
+            </div>
+            <div class="rgochat-ftr">
+                <input type="text" id="rgochat-in" class="rgochat-in" placeholder="Type your message..." maxlength="1000">
+                <button id="rgochat-send" class="rgochat-send">Send</button>
+            </div>
+        `;
+        document.body.appendChild(box);
+
+        const body = box.querySelector('#rgochat-body');
+        const empty = box.querySelector('#rgochat-empty');
+        const input = box.querySelector('#rgochat-in');
+        const sendBtn = box.querySelector('#rgochat-send');
+        const closeBtn = box.querySelector('.rgochat-x');
+
+        let lastId = 0;
+        let timer = null;
+        const POLL = 3500;
+
+        function openChat() {
+            box.style.display = 'block';
+            if (!timer) {
+                fetchMsgs(true);
+                timer = setInterval(fetchMsgs, POLL);
+            }
+            setTimeout(() => input.focus(), 50);
+        }
+        function closeChat() {
+            box.style.display = 'none';
+            if (timer) { clearInterval(timer); timer = null; }
+        }
+        closeBtn.addEventListener('click', closeChat);
+
+        document.querySelector('.sidebar').addEventListener('click', (e) => {
+            const t = e.target;
+            if (t.classList.contains('sidebar-btn') && /contact rgo/i.test(t.textContent || '')) {
+                openChat();
+                document.getElementById('sidebar').classList.remove('open');
+                document.getElementById('overlay').classList.remove('show');
+            }
+        });
+
+        function addBubble(sender, message) {
+            if (empty) empty.style.display = 'none';
+            const b = document.createElement('div');
+            b.className = 'rgochat-msg ' + (sender === 'student' ? 'rgochat-me' : 'rgochat-admin');
+            b.textContent = message;
+            body.appendChild(b);
+            body.scrollTop = body.scrollHeight;
+        }
+
+        async function fetchMsgs(initial=false) {
+            try {
+                const fd = new FormData();
+                fd.append('action','chat_fetch');
+                fd.append('since_id', initial ? 0 : (lastId||0));
+                const res = await fetch(window.location.href, { method:'POST', body: fd });
+                const data = await res.json();
+                if (!data.ok) return;
+                (data.messages || []).forEach(m => {
+                    addBubble(m.sender, m.message);
+                    if (!lastId || m.id > lastId) lastId = m.id;
+                });
+            } catch (e) { console.error('chat_fetch', e); }
+        }
+
+        async function sendMsg() {
+            const text = (input.value || '').trim();
+            if (!text) return;
+            sendBtn.disabled = true;
+            try {
+                const fd = new FormData();
+                fd.append('action','chat_send');
+                fd.append('message', text);
+                const res = await fetch(window.location.href, { method:'POST', body: fd });
+                const data = await res.json();
+                if (data.ok) {
+                    addBubble('student', text);
+                    input.value = '';
+                    if (data.message && data.message.id) lastId = Math.max(lastId, data.message.id);
+                } else {
+                    alert(data.msg || 'Failed to send.');
+                }
+            } catch (e) {
+                console.error('chat_send', e);
+                alert('Network error.');
+            } finally {
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
+        input.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); sendMsg(); } });
+        sendBtn.addEventListener('click', sendMsg);
+    })();
+
+    setInterval(() => {
+        fetch("heartbeat.php");
+    }, 30000); 
+    </script>
 </body>
 
 </html>
