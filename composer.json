@@ -1,5 +1,12 @@
 {
+    "config": {
+      "platform": {
+        "php": "8.0.28"
+      }
+    },
     "require": {
+        "spomky-labs/otphp": "^10.0",
+        "endroid/qr-code": "^3.9",
         "phpmailer/phpmailer": "^7.0"
     }
-}
+  }

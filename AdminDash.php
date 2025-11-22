@@ -1,11 +1,10 @@
-
 <?php
 
 session_start();
 
 // If not logged in, go back to login screen
 if (!isset($_SESSION['admin_login_id'])) {
-  header("Location: UserLogin.php");
+  header("Location: index.php");
   exit();
 }
 include 'db.php';
@@ -32,7 +31,33 @@ $sidebar_position = $adminData['admin_position'] ?? "Administrator";
 $sidebar_profile = $adminData['profile_p'] ?? null;
 
 /* =======================================================
-   ADD ADMIN ACCOUNT (FIXED FOR YOUR admin TABLE STRUCTURE)
+   LOW STOCKS QUERY FOR POPUP (stock <= 5)
+   ======================================================= */
+
+$lowStocks = [];
+$lowRes = $conn->query("
+    SELECT 
+        i.category,
+        i.item_name,
+        s.label,
+        s.stock
+    FROM items i
+    JOIN item_sizes s ON s.item_id = i.item_id
+    WHERE s.stock IS NOT NULL AND s.stock <= 5
+");
+if ($lowRes) {
+  while ($row = $lowRes->fetch_assoc()) {
+    $lowStocks[] = [
+      'category' => $row['category'],
+      'item_name' => $row['item_name'],
+      'label' => $row['label'],
+      'stock' => (int) $row['stock']
+    ];
+  }
+}
+
+/* =======================================================
+   ADD ADMIN ACCOUNT
    ======================================================= */
 
 $add_admin_success = '';
@@ -340,7 +365,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 /* ========== END of added admin chat server APIs ========== */
 
 /* ------------------------------------------
-   Add Student (your original code - unchanged)
+   Add Student (original)
 ------------------------------------------- */
 $error = '';
 $success = '';
@@ -400,52 +425,115 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['add_student'])) {
 }
 
 /* ------------------------------------------
-   AJAX: Get one item (for Edit modal prefill)
+   AJAX: Get item (by id OR by category+item_name)
 ------------------------------------------- */
-if (isset($_GET['action']) && $_GET['action'] === 'get_item' && isset($_GET['id'])) {
-  $item_id = (int) $_GET['id'];
-
-  $item_stmt = $conn->prepare("SELECT item_id, category, item_name, description, base_price FROM items WHERE item_id=?");
-  $item_stmt->bind_param("i", $item_id);
-  $item_stmt->execute();
-  $item = $item_stmt->get_result()->fetch_assoc();
-  $item_stmt->close();
-
-  $sizes = [];
-  $sz = $conn->prepare("SELECT label, price, stock, notes FROM item_sizes WHERE item_id=? ORDER BY size_id ASC");
-  $sz->bind_param("i", $item_id);
-  $sz->execute();
-  $rsz = $sz->get_result();
-  while ($row = $rsz->fetch_assoc()) {
-    $sizes[] = [
-      'label' => $row['label'],
-      'price' => is_null($row['price']) ? 0 : (float) $row['price'],
-      'stock' => is_null($row['stock']) ? null : (int) $row['stock'],
-      'notes' => $row['notes'] ?? ''
-    ];
-  }
-  $sz->close();
-
-  $images = [];
-  $im = $conn->prepare("SELECT image_id, image_data FROM item_images WHERE item_id=? ORDER BY image_id ASC");
-  $im->bind_param("i", $item_id);
-  $im->execute();
-  $rim = $im->get_result();
-  while ($row = $rim->fetch_assoc()) {
-    $images[] = [
-      'image_id' => (int) $row['image_id'],
-      'data_url' => 'data:image/jpeg;base64,' . base64_encode($row['image_data'])
-    ];
-  }
-  $im->close();
+if (isset($_GET['action']) && $_GET['action'] === 'get_item') {
 
   header('Content-Type: application/json');
-  echo json_encode(['ok' => (bool) $item, 'item' => $item, 'sizes' => $sizes, 'images' => $images]);
+
+  // By ID (original behavior)
+  if (isset($_GET['id'])) {
+    $item_id = (int) $_GET['id'];
+
+    $item_stmt = $conn->prepare("SELECT item_id, category, item_name, description, base_price FROM items WHERE item_id=?");
+    $item_stmt->bind_param("i", $item_id);
+    $item_stmt->execute();
+    $item = $item_stmt->get_result()->fetch_assoc();
+    $item_stmt->close();
+
+    $sizes = [];
+    if ($item) {
+      $sz = $conn->prepare("SELECT label, price, stock, notes FROM item_sizes WHERE item_id=? ORDER BY size_id ASC");
+      $sz->bind_param("i", $item_id);
+      $sz->execute();
+      $rsz = $sz->get_result();
+      while ($row = $rsz->fetch_assoc()) {
+        $sizes[] = [
+          'label' => $row['label'],
+          'price' => is_null($row['price']) ? 0 : (float) $row['price'],
+          'stock' => is_null($row['stock']) ? null : (int) $row['stock'],
+          'notes' => $row['notes'] ?? ''
+        ];
+      }
+      $sz->close();
+
+      $images = [];
+      $im = $conn->prepare("SELECT image_id, image_data FROM item_images WHERE item_id=? ORDER BY image_id ASC");
+      $im->bind_param("i", $item_id);
+      $im->execute();
+      $rim = $im->get_result();
+      while ($row = $rim->fetch_assoc()) {
+        $images[] = [
+          'image_id' => (int) $row['image_id'],
+          'data_url' => 'data:image/jpeg;base64,' . base64_encode($row['image_data'])
+        ];
+      }
+      $im->close();
+
+      echo json_encode(['ok' => true, 'item' => $item, 'sizes' => $sizes, 'images' => $images]);
+      exit();
+    } else {
+      echo json_encode(['ok' => false, 'item' => null]);
+      exit();
+    }
+  }
+
+  // New: by category + item_name
+  if (isset($_GET['category']) && isset($_GET['item_name'])) {
+    $category = trim($_GET['category']);
+    $iname = trim($_GET['item_name']);
+
+    $item_stmt = $conn->prepare("SELECT item_id, category, item_name, description, base_price FROM items WHERE category = ? AND item_name = ? LIMIT 1");
+    $item_stmt->bind_param("ss", $category, $iname);
+    $item_stmt->execute();
+    $item = $item_stmt->get_result()->fetch_assoc();
+    $item_stmt->close();
+
+    if (!$item) {
+      echo json_encode(['ok' => false, 'item' => null]);
+      exit();
+    }
+
+    $item_id = (int) $item['item_id'];
+
+    $sizes = [];
+    $sz = $conn->prepare("SELECT label, price, stock, notes FROM item_sizes WHERE item_id=? ORDER BY size_id ASC");
+    $sz->bind_param("i", $item_id);
+    $sz->execute();
+    $rsz = $sz->get_result();
+    while ($row = $rsz->fetch_assoc()) {
+      $sizes[] = [
+        'label' => $row['label'],
+        'price' => is_null($row['price']) ? 0 : (float) $row['price'],
+        'stock' => is_null($row['stock']) ? null : (int) $row['stock'],
+        'notes' => $row['notes'] ?? ''
+      ];
+    }
+    $sz->close();
+
+    $images = [];
+    $im = $conn->prepare("SELECT image_id, image_data FROM item_images WHERE item_id=? ORDER BY image_id ASC");
+    $im->bind_param("i", $item_id);
+    $im->execute();
+    $rim = $im->get_result();
+    while ($row = $rim->fetch_assoc()) {
+      $images[] = [
+        'image_id' => (int) $row['image_id'],
+        'data_url' => 'data:image/jpeg;base64,' . base64_encode($row['image_data'])
+      ];
+    }
+    $im->close();
+
+    echo json_encode(['ok' => true, 'item' => $item, 'sizes' => $sizes, 'images' => $images]);
+    exit();
+  }
+
+  echo json_encode(['ok' => false, 'item' => null]);
   exit();
 }
 
 /* ------------------------------------------
-   Add Item (existing)
+   Add Item
 ------------------------------------------- */
 $add_item_success = '';
 $add_item_error = '';
@@ -526,7 +614,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_item'])) {
 }
 
 /* ------------------------------------------
-   UPDATE Item (NEW)
+   UPDATE Item
 ------------------------------------------- */
 $update_item_success = '';
 $update_item_error = '';
@@ -603,7 +691,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_item'])) {
 }
 
 /* ------------------------------------------
-   DELETE Item (NEW)
+   DELETE Item
 ------------------------------------------- */
 $delete_item_success = '';
 $delete_item_error = '';
@@ -1667,7 +1755,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     </div>
 
     <?php
-    // flash notices after updates/deletes
+    // flash notices
     if (!empty($update_item_success))
       echo '<p style="color:green;margin:10px 0;">' . htmlspecialchars($update_item_success) . '</p>';
     if (!empty($update_item_error))
@@ -1699,7 +1787,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         SELECT
           i.item_id, i.category, i.item_name,
           MIN(s.price) AS min_price, MAX(s.price) AS max_price,
-          COUNT(s.size_id) AS size_count,
+          SUM(COALESCE(s.stock,0)) AS total_stock,
           (SELECT image_data FROM item_images im WHERE im.item_id = i.item_id ORDER BY im.image_id ASC LIMIT 1) AS img_blob
         FROM items i
         LEFT JOIN item_sizes s ON s.item_id = i.item_id
@@ -1733,10 +1821,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
                   <span><?= htmlspecialchars($row['item_name']) ?></span>
                 </div>
               </td>
-              <td><?= (int) ($row['size_count'] ?? 0) ?></td>
+              <td><?= (int) ($row['total_stock'] ?? 0) ?></td>
               <td>₱<?= $price_display ?></td>
               <td>
-                <button class="view-btn btn-edit-item" data-id="<?= (int) $row['item_id'] ?>">Edit</button>
+                <!-- Edit button removed as requested -->
                 <button class="delete-btn btn-del-item" data-id="<?= (int) $row['item_id'] ?>">Delete</button>
               </td>
             </tr>
@@ -1779,9 +1867,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       <tbody>
 
         <?php
-        /* ======================================
-           FETCH STUDENTS
-           ====================================== */
+        /* FETCH STUDENTS */
         $students = $conn->query("
     SELECT 
         id AS uid,
@@ -1793,9 +1879,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     ORDER BY id DESC
 ");
 
-        /* ======================================
-           FETCH ADMINS (FIXED JOIN)
-           ====================================== */
+        /* FETCH ADMINS */
         $admins = $conn->query("
     SELECT 
         a.admin_id AS uid,
@@ -1808,9 +1892,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     ORDER BY a.admin_id DESC
 ");
 
-        /* ======================================
-           DISPLAY STUDENTS
-           ====================================== */
+        /* DISPLAY STUDENTS */
         if ($students) {
           while ($s = $students->fetch_assoc()) {
 
@@ -1834,9 +1916,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           }
         }
 
-        /* ======================================
-           DISPLAY ADMINS (NOW WORKS)
-           ====================================== */
+        /* DISPLAY ADMINS */
         if ($admins) {
           while ($a = $admins->fetch_assoc()) {
 
@@ -1907,7 +1987,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           <input type="text" name="admin_position" required>
 
           <label>Profile Picture</label>
-          <input type="file" name="profile_p" accept="image/*">
+          <input type="file" name="admin_p" accept="image/*">
           <label>Email</label>
           <input type="text" name="email" required>
           <label>Password</label>
@@ -1920,7 +2000,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
   </div>
 
 
-  <!-- ===== Add/Edit Item Modal (same modal; now supports edit) ===== -->
+  <!-- ===== Add/Edit Item Modal ===== -->
   <div id="addItemModalFE" class="additem-modal" aria-hidden="true">
     <div class="additem-panel" role="dialog" aria-modal="true" aria-labelledby="addItemTitleFE">
       <div class="additem-header">
@@ -1929,11 +2009,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       </div>
 
       <div class="additem-body">
-        <!-- IMPORTANT: now a real form -->
+        <!-- IMPORTANT: real form -->
         <form id="addItemFormFE" method="POST" enctype="multipart/form-data">
-          <!-- Mode toggles: Add vs Update (JS will switch which hidden field is present) -->
+          <!-- Mode toggles: Add vs Update -->
           <input type="hidden" name="add_item" id="modeAddField" value="1">
-          <input type="hidden" name="update_item" id="modeUpdateField" value="1" disabled style="display:none;">
+          <input type="hidden" name="" id="modeUpdateField" value="1" disabled style="display:none;">
           <input type="hidden" name="edit_item_id" id="editItemIdFE" value="0">
           <input type="hidden" name="sizes_json" id="sizesJsonFE" value="[]">
 
@@ -1942,17 +2022,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
               <label>Category</label>
               <select id="feCategory" name="category"
                 style="width:100%;padding:10px;border:1px solid #ccc;border-radius:8px">
-                <option value="uniforms">Uniforms</option>
-                <option value="textile">Textile</option>
-                <option value="pants">Pants</option>
-                <option value="accessories">Accessories</option>
-                <option value="skirts">Skirts</option>
+                <option value="">Select Category</option>
+                <option value="textile">TEXTILE</option>
+                <option value="uniforms">UNIFORM</option>
+                <option value="accessories">ACCESSORIES</option>
               </select>
             </div>
             <div>
               <label>Item Name</label>
-              <input id="feName" name="item_name" placeholder="e.g., PE Uniform" required
-                style="width:100%;padding:10px;border:1px solid #ccc;border-radius:8px">
+              <!-- original input for backend -->
+              <input id="feName" name="item_name" placeholder="e.g., PE Uniform"
+                style="width:100%;padding:10px;border:1px solid:#ccc;border-radius:8px">
+              <!-- dropdown driven by category -->
+              <select id="feNameSelect"
+                style="width:100%;padding:10px;border:1px solid #ccc;border-radius:8px;margin-top:6px;display:none;"></select>
             </div>
 
             <div style="grid-column:1/-1">
@@ -1987,20 +2070,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
 
           <div style="height:1px;background:#eee;margin:14px 0"></div>
 
-          <label>Sizes & Prices</label>
+          <label>Sizes & Stocks</label>
           <table class="slim" id="sizesTableFE">
             <thead>
               <tr>
                 <th>Size</th>
                 <th>Price (₱)</th>
-                <th>Stock (opt)</th>
-                <th>Notes (opt)</th>
-                <th></th>
+                <th>Current Stock</th>
+                <th>Add Stock</th>
               </tr>
             </thead>
             <tbody></tbody>
           </table>
-          <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+          <!-- Add size buttons hidden as requested -->
+          <div style="display:none;gap:8px;justify-content:flex-end;margin-top:10px">
             <button type="button" id="addSizeRowFE" class="btn-chip">Add Size</button>
             <button type="button" id="addPresetFE" class="btn-chip">Preset: XS–XL</button>
           </div>
@@ -2116,8 +2199,194 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           <?php if (!empty($delete_item_error)): ?> alert("<?= addslashes($delete_item_error); ?>"); <?php endif; ?>
     <?php endif; ?>
 
-      // ===== Add/Edit Item Modal (wired to backend; stays a modal) =====
+      // ===== Add/Edit Item Modal =====
       (function () {
+        const CATEGORY_ITEMS = {
+          textile: [
+            {
+              name: 'WHITE FABRIC EMBEDDED',
+              desc: 'Bright, crisp, and long-lasting white fabric crafted for school uniforms.'
+            },
+            {
+              name: 'CHECKERED (FOR COLLEGE SKIRTS)',
+              desc: 'Classic checkered fabric tailored for sleek and stylish college skirts.'
+            },
+            {
+              name: 'REMINGTON (FOR COLLEGE PANTS)',
+              desc: 'High-quality Remington fabric made for strong, comfortable college pants.'
+            }
+          ],
+          uniforms: [
+            { name: 'UNIFORM', desc: 'Standard university uniform.' },
+            { name: 'COLLEGE BLOUSE', desc: 'Formal blouse for college uniforms.' },
+            { name: 'COLLEGE BARONG', desc: 'Classic barong for college events and uniforms.' },
+            { name: 'COLLEGE PANTS', desc: 'Tailored pants for college uniforms.' },
+            { name: 'COLLEGE SKIRT', desc: 'Formal skirt for college uniforms.' }
+          ],
+          accessories: [
+            { name: 'ID LACES', desc: 'Durable ID laces for daily campus use.' },
+            { name: 'COLLAR PINS', desc: 'Metal collar pins featuring school insignia.' }
+          ]
+        };
+
+        const CATEGORY_SIZES = {
+          textile: ['1 YARD', '2 YARDS', '3 YARDS'],
+          uniforms: ['XS', 'S', 'M', 'L', 'XL', 'XXL'],
+          skirts: ['24', '25', '26', '27', '28', '29', '30', '31', '32'],
+          blouse: ['XS', 'S', 'M', 'L', 'XL', 'XXL'],
+          barong: ['XS', 'S', 'M', 'L', 'XL', 'XXL'],
+          pants: ['28', '29', '30', '31', '32', '33', '34'],
+          accessories: ['ONE SIZE']
+        };
+
+          // === Default prices per ITEM NAME + SIZE LABEL ===
+  // NOTE: keys are UPPERCASE, so we uppercase when we match.
+  const ITEM_SIZE_PRICES = {
+    // ── TEXTILE (per yard) ─────────────────────────────
+    'WHITE FABRIC EMBEDDED': {
+      '1 YARD': 150.00,
+      '2 YARDS': 300.00, // assumed x2
+      '3 YARDS': 450.00  // assumed x3
+    },
+    'CHECKERED (FOR COLLEGE SKIRTS)': {
+      '1 YARD': 150.00,
+      '2 YARDS': 300.00,
+      '3 YARDS': 450.00
+    },
+    'REMINGTON (FOR COLLEGE PANTS)': {
+      '1 YARD': 150.00,
+      '2 YARDS': 300.00,
+      '3 YARDS': 450.00
+    },
+
+    // ── COLLEGE SKIRT ──────────────────────────────────
+    // Small–Large – 320.00 , XL–5XL – 355.00 , Special Sizes – 450.00
+    'COLLEGE SKIRT': {
+      // letter sizes (if you use uniforms category)
+      'XS': 320.00,
+      'S': 320.00,
+      'M': 320.00,
+      'L': 320.00,
+      'XL': 355.00,
+      'XXL': 355.00,
+      '3XL': 355.00,
+      '4XL': 355.00,
+      '5XL': 355.00,
+      'SPECIAL': 450.00,
+
+      // numeric waist sizes (if you use skirts category)
+      '24': 320.00,
+      '25': 320.00,
+      '26': 320.00,
+      '27': 320.00,
+      '28': 320.00,
+      '29': 320.00,
+      '30': 320.00,
+      '31': 355.00,
+      '32': 355.00
+    },
+
+    // ── COLLEGE BLOUSE ─────────────────────────────────
+    // Small–Large 350.00, Medium–3XL – 380.00, 4XL–5XL – 395.00, Special Size 450.00
+    'COLLEGE BLOUSE': {
+      'XS': 350.00,
+      'S': 350.00,
+      'M': 350.00,
+      'L': 350.00,
+
+      'XL': 380.00,
+      'XXL': 380.00,
+      '3XL': 380.00,
+
+      '4XL': 395.00,
+      '5XL': 395.00,
+
+      'SPECIAL': 450.00
+    },
+
+    // ── COLLEGE BARONG ─────────────────────────────────
+    // 18–Small – 350.00 , Medium–Large 370.00 , XL–2XL – 400.00 , 3XL–5XL – 440.00 , Special – 450.00
+    'COLLEGE BARONG': {
+      '18': 350.00,
+      'XS': 350.00,
+      'S': 350.00,
+
+      'M': 370.00,
+      'L': 370.00,
+
+      'XL': 400.00,
+      'XXL': 400.00,
+
+      '3XL': 440.00,
+      '4XL': 440.00,
+      '5XL': 440.00,
+
+      'SPECIAL': 450.00
+    },
+
+    // ── COLLEGE PANTS ──────────────────────────────────
+    // 16–40 (waistline) 380.00, 42–46 – 390.00
+    'COLLEGE PANTS': {
+      // generic letter sizes
+      'XS': 380.00,
+      'S': 380.00,
+      'M': 380.00,
+      'L': 380.00,
+      'XL': 380.00,
+      'XXL': 380.00,
+
+      // numeric (if you use pants category; adjust as needed)
+      '16': 380.00, '18': 380.00, '20': 380.00, '22': 380.00, '24': 380.00,
+      '26': 380.00, '28': 380.00, '30': 380.00, '32': 380.00, '34': 380.00,
+      '36': 380.00, '38': 380.00, '40': 380.00,
+      '42': 390.00, '44': 390.00, '46': 390.00
+    },
+
+    // ── ACCESSORIES ────────────────────────────────────
+    'ID LACES': {
+      'ONE SIZE': 60.00
+    },
+    'COLLAR PINS': {
+      'ONE SIZE': 0.00 // TODO: put the real price here
+    }
+  };
+
+        // ==== NEW HELPERS FOR AUTO-PRICE BY ITEM + SIZE ====
+
+        function getCurrentItemName() {
+          const rawFromSelect = (typeof feNameSelect !== 'undefined' && feNameSelect && feNameSelect.style.display !== 'none')
+            ? (feNameSelect.value || '')
+            : '';
+          const rawFromInput = feName ? (feName.value || '') : '';
+          const raw = rawFromSelect || rawFromInput;
+          return raw.trim().toUpperCase();
+        }
+
+        function applyDefaultPricesForCurrentItem() {
+          const itemName = getCurrentItemName();
+          if (!itemName || !ITEM_SIZE_PRICES[itemName]) return;
+          if (!sizesTableFE) return;
+
+          const priceMap = ITEM_SIZE_PRICES[itemName];
+          const rows = sizesTableFE.querySelectorAll('tr');
+
+          rows.forEach(tr => {
+            const labelInput = tr.querySelector('.sz-label');
+            const priceInput = tr.querySelector('.sz-price');
+            if (!labelInput || !priceInput) return;
+
+            const currentVal = (priceInput.value || '').trim();
+            // do not override if user or DB already has a non-zero price
+            if (currentVal !== '' && currentVal !== '0' && currentVal !== '0.00') return;
+
+            const lbl = (labelInput.value || '').trim().toUpperCase();
+            if (priceMap[lbl] != null) {
+              priceInput.value = priceMap[lbl].toFixed(2);
+            }
+          });
+        }
+
+
         const modal = document.getElementById('addItemModalFE');
         const openBtn = document.getElementById('addItemBtn');
         const closeX = document.getElementById('addItemCloseFE');
@@ -2132,6 +2401,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
 
         const feCategory = document.getElementById('feCategory');
         const feName = document.getElementById('feName');
+        const feNameSelect = document.getElementById('feNameSelect');
         const feDesc = document.getElementById('feDesc');
         const feBasePrice = document.getElementById('feBasePrice');
         const feImages = document.getElementById('feImages');
@@ -2170,7 +2440,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           modeAddField.disabled = false; modeAddField.name = 'add_item';
           modeUpdateField.disabled = true; modeUpdateField.name = '';
           editImagesNote.style.display = 'none';
-          existingPreviewFE.innerHTML = '';
         }
         function switchToEditMode(itemId) {
           addItemTitleFE.textContent = 'Edit Item';
@@ -2185,8 +2454,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         function closeModal() { modal.classList.remove('show'); modal.setAttribute('aria-hidden', 'true'); }
 
         function clearForm() {
-          feCategory.value = 'uniforms';
+          feCategory.value = '';
           feName.value = '';
+          feNameSelect.innerHTML = '';
+          feNameSelect.style.display = 'none';
+          feName.style.display = 'block';
           feDesc.value = '';
           feBasePrice.value = '';
           imgs = [];
@@ -2195,9 +2467,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           sizesTableFE.innerHTML = '';
           addSizeRow(); // one row to start
           updateAllPreviews();
+          updateCategoryDependentState();
         }
 
-        openBtn?.addEventListener('click', () => { switchToAddMode(); clearForm(); openModal(); });
+        function openForAdd() {
+          switchToAddMode();
+          clearForm();
+          openModal();
+        }
+
+        openBtn?.addEventListener('click', openForAdd);
         closeX?.addEventListener('click', closeModal);
         closeBtn?.addEventListener('click', closeModal);
         modal?.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
@@ -2224,44 +2503,198 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
             d.draggable = true;
             d.addEventListener('dragstart', ev => { ev.dataTransfer.setData('text/plain', i.toString()); });
             d.addEventListener('dragover', ev => ev.preventDefault());
-            d.addEventListener('drop', ev => { ev.preventDefault(); const from = parseInt(ev.dataTransfer.getData('text/plain'), 10); const to = i; if (from === to) return; const [m] = imgs.splice(from, 1); imgs.splice(to, 0, m); renderThumbs(); updateAllPreviews(); });
+            d.addEventListener('drop', ev => {
+              ev.preventDefault();
+              const from = parseInt(ev.dataTransfer.getData('text/plain'), 10);
+              const to = i;
+              if (from === to) return;
+              const [m] = imgs.splice(from, 1);
+              imgs.splice(to, 0, m);
+              renderThumbs();
+              updateAllPreviews();
+            });
             d.appendChild(im); d.appendChild(tg); d.appendChild(rm); imgPreviewFE.appendChild(d);
           });
         }
 
-        function addSizeRow(val = { label: '', price: '', stock: '', notes: '' }) {
+        function addSizeRow(val = { label: '', price: '', stock: null }) {
+          const existing = (val.stock === null || val.stock === undefined || isNaN(val.stock)) ? 0 : Number(val.stock);
+          const initialAdd = val.add || 0;
+
           const tr = document.createElement('tr');
+          tr.dataset.existingStock = String(existing);
+
           tr.innerHTML = `
-          <td><input class="sz-label" placeholder="e.g., S" style="width:110px;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.label}"></td>
-          <td><input class="sz-price" type="number" step="0.01" min="0" style="width:120px;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.price}"></td>
-          <td><input class="sz-stock" type="number" min="0" placeholder="optional" style="width:110px;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.stock ?? ''}"></td>
-          <td><input class="sz-notes" placeholder="optional" style="width:100%;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.notes ?? ''}"></td>
-          <td><button type="button" class="delete-btn rm" style="padding:6px 10px">Remove</button></td>
+          <td><input class="sz-label" placeholder="e.g., S" style="width:110px;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.label ?? ''}"></td>
+          <td><input class="sz-price" type="number" step="0.01" min="0" style="width:120px;padding:8px;border:1px solid #ccc;border-radius:6px" value="${val.price ?? ''}"></td>
+        <td>
+  <input
+    class="sz-stock-current"
+    type="number"
+    value="${existing}"
+    disabled
+    readonly
+    style="width:100px;padding:8px;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;pointer-events:none"
+  >
+</td>
+
+          <td>
+            <input class="sz-stock-add" type="number" min="0" placeholder="0"
+              style="width:100px;padding:8px;border:1px solid #ccc;border-radius:6px"
+              value="${initialAdd || ''}">
+          </td>
         `;
-          tr.querySelector('.rm').onclick = () => { tr.remove(); updateAllPreviews(); };
-          ['input', 'change'].forEach(ev => tr.addEventListener(ev, updateAllPreviews));
+
+          ['input', 'change'].forEach(ev => tr.addEventListener(ev, () => {
+            updateAllPreviews();
+          }));
+
           sizesTableFE.appendChild(tr);
         }
+
+        // (buttons for add/preset exist but are hidden in HTML)
         addSizeRowFE?.addEventListener('click', () => addSizeRow());
         addPresetFE?.addEventListener('click', () => {
           sizesTableFE.innerHTML = '';
-          ['XS', 'S', 'M', 'L', 'XL'].forEach(s => addSizeRow({ label: s, price: '0', stock: '', notes: '' }));
+          ['XS', 'S', 'M', 'L', 'XL'].forEach(s => addSizeRow({ label: s, price: '0', stock: 0 }));
           updateAllPreviews();
         });
 
-        [feCategory, feName, feDesc, feBasePrice].forEach(el => el.addEventListener('input', updateAllPreviews));
+        function updateItemNameOptions(isEditPrefill) {
+          const cat = feCategory.value;
+          const items = CATEGORY_ITEMS[cat] || [];
+          feNameSelect.innerHTML = '';
+
+          if (!cat) {
+            feNameSelect.style.display = 'none';
+            feName.style.display = 'block';
+            return;
+          }
+
+          if (items.length) {
+            feNameSelect.style.display = 'block';
+            feName.style.display = 'none';
+
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.disabled = true;
+            placeholder.selected = true;
+            placeholder.textContent = 'Select item name...';
+            feNameSelect.appendChild(placeholder);
+
+            items.forEach(it => {
+              const opt = document.createElement('option');
+              opt.value = it.name;
+              opt.textContent = it.name;
+              feNameSelect.appendChild(opt);
+            });
+
+            if (isEditPrefill && feName.value) {
+              const match = items.find(i => i.name === feName.value);
+              if (match) {
+                feNameSelect.value = match.name;
+                if (!feDesc.value || !feDesc.value.trim()) {
+                  feDesc.value = match.desc;
+                }
+              }
+            }
+          } else {
+            feNameSelect.style.display = 'none';
+            feName.style.display = 'block';
+          }
+        }
+
+        function updateSizesForCategory(forceReplace = false) {
+          const cat = feCategory.value;
+          const defs = CATEGORY_SIZES[cat];
+          if (!defs || !defs.length) return;
+
+          // As requested: no validation / confirm popup when changing category
+          sizesTableFE.innerHTML = '';
+          defs.forEach(lbl => addSizeRow({ label: lbl, price: '', stock: 0 }));
+
+          // NEW: auto-apply default prices for this item (if mapped)
+          applyDefaultPricesForCurrentItem();
+
+          updateAllPreviews();
+        }
+
+        function updateCategoryDependentState() {
+          const hasCat = !!feCategory.value;
+
+          const fields = [feName, feDesc, feBasePrice, feImages, doneFE];
+          fields.forEach(f => { if (f) f.disabled = !hasCat; });
+          if (feNameSelect) feNameSelect.disabled = !hasCat;
+
+          const sizeInputs = sizesTableFE.querySelectorAll('input, select, button');
+          sizeInputs.forEach(inp => {
+            if (!inp.closest('.non-category')) {
+              inp.disabled = !hasCat && inp.type !== 'hidden';
+            }
+          });
+        }
+
+        feNameSelect.addEventListener('change', () => {
+          const cat = feCategory.value;
+          const items = CATEGORY_ITEMS[cat] || [];
+          const selectedName = feNameSelect.value;
+          feName.value = selectedName || '';
+          const selectedMeta = items.find(i => i.name === selectedName);
+          if (selectedMeta && (!feDesc.value || !feDesc.value.trim())) {
+            feDesc.value = selectedMeta.desc;
+          }
+
+          // NEW: apply default prices when a predefined item is chosen
+          applyDefaultPricesForCurrentItem();
+
+          updateAllPreviews();
+          tryLoadItemByCategoryName(); // load from DB when category+item selected
+        });
+
+        feCategory.addEventListener('change', () => {
+          updateItemNameOptions(false);
+          updateSizesForCategory(true);
+          updateCategoryDependentState();
+          updateAllPreviews();
+        });
+
+        [feName, feDesc, feBasePrice].forEach(el => el.addEventListener('input', updateAllPreviews));
+
+        // NEW: when typing item name manually, attempt to auto-fill default prices
+        feName.addEventListener('input', () => {
+          applyDefaultPricesForCurrentItem();
+          updateAllPreviews();
+        });
+
+        feName.addEventListener('change', () => {
+          // NEW: also apply default prices on blur/change
+          applyDefaultPricesForCurrentItem();
+          updateAllPreviews();
+          tryLoadItemByCategoryName(); // also trigger DB load on manual name change
+        });
 
         function collectSizes() {
           const rows = [...sizesTableFE.querySelectorAll('tr')];
           return rows.map(r => {
             const label = r.querySelector('.sz-label').value.trim();
-            const price = parseFloat(r.querySelector('.sz-price').value || '0');
-            const stock = r.querySelector('.sz-stock').value.trim();
-            const notes = r.querySelector('.sz-notes').value.trim();
+            const priceVal = r.querySelector('.sz-price').value;
+            const addVal = r.querySelector('.sz-stock-add').value.trim();
+            const currentInput = r.querySelector('.sz-stock-current');
+
+            const existing = currentInput ? Number(currentInput.value || '0') : Number(r.dataset.existingStock || '0');
+            const addNum = addVal === '' ? 0 : (parseInt(addVal, 10) || 0);
+            const finalStock = existing + addNum;
+
             if (!label) return null;
-            return { label, price: isNaN(price) ? 0 : price, stock: (stock === '' ? null : parseInt(stock, 10) || 0), notes };
+            const price = parseFloat(priceVal || '0');
+            return {
+              label,
+              price: isNaN(price) ? 0 : price,
+              stock: finalStock
+            };
           }).filter(Boolean);
         }
+
         function formatPrice(n) { try { return '₱' + (Number(n).toFixed(2)); } catch { return '₱0.00'; } }
         function deriveDisplayPrice() {
           const s = collectSizes();
@@ -2358,9 +2791,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
 
         function updateAllPreviews() { updateCardPreview(); updatePanelPreview(); }
 
+        // Load an item from DB by category+name (used when selecting Category + Item Name)
+        async function tryLoadItemByCategoryName() {
+          const cat = feCategory.value;
+          const nm = feName.value.trim();
+          if (!cat || !nm) return;
+
+          try {
+            const res = await fetch(`<?php echo basename(__FILE__); ?>?action=get_item&category=${encodeURIComponent(cat)}&item_name=${encodeURIComponent(nm)}`);
+            const data = await res.json();
+            if (!data.ok || !data.item) {
+              // If no item exists for this combination, stay in ADD mode
+              switchToAddMode();
+              // keep selected category and name, reset sizes to defaults for category
+              feCategory.value = cat;
+              feName.value = nm;
+              updateItemNameOptions(true);
+              sizesTableFE.innerHTML = '';
+              updateSizesForCategory(true);
+              updateCategoryDependentState();
+              updateAllPreviews();
+              return;
+            }
+
+            const item = data.item;
+            switchToEditMode(item.item_id);
+
+            // Fill fields from DB
+            feCategory.value = item.category || cat;
+            feName.value = item.item_name || nm;
+            feDesc.value = item.description || '';
+            feBasePrice.value = (item.base_price !== null && item.base_price !== undefined) ? item.base_price : '';
+
+            updateItemNameOptions(true);
+
+            // Existing images preview (for reference)
+            existingPreviewFE.innerHTML = '';
+            if (Array.isArray(data.images) && data.images.length) {
+              data.images.forEach((im, i) => {
+                const d = document.createElement('div'); d.className = 'thumb';
+                const ig = document.createElement('img'); ig.src = im.data_url;
+                const tg = document.createElement('span'); tg.className = 'tag'; tg.textContent = i === 0 ? 'Current Cover' : 'Current #' + (i + 1);
+                d.appendChild(ig); d.appendChild(tg); existingPreviewFE.appendChild(d);
+              });
+            }
+
+            // Sizes from DB: Current Stock is loaded from DB, not editable
+            sizesTableFE.innerHTML = '';
+            if (Array.isArray(data.sizes) && data.sizes.length) {
+              data.sizes.forEach(s => addSizeRow({
+                label: s.label || '',
+                price: s.price || 0,
+                stock: (s.stock === null ? 0 : s.stock)
+              }));
+            } else {
+              sizesTableFE.innerHTML = '';
+              updateSizesForCategory(true);
+            }
+
+            // Reset images selection if any previous files
+            feImages.value = '';
+            imgs = [];
+            imgPreviewFE.innerHTML = '';
+
+            updateCategoryDependentState();
+            updateAllPreviews();
+            openModal();
+          } catch (e) {
+            console.error(e);
+          }
+        }
+
         // init
         addSizeRow();
         updateAllPreviews();
+        updateCategoryDependentState();
 
         // Serialize sizes to hidden json before submit
         form.addEventListener('submit', () => {
@@ -2368,63 +2873,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           sizesJsonField.value = JSON.stringify(payload);
         });
 
-        // ========== EDIT & DELETE HOOKS ==========
-        // Edit
-        document.querySelectorAll('.btn-edit-item').forEach(btn => {
-          btn.addEventListener('click', async () => {
-            const id = btn.dataset.id;
-            try {
-              const res = await fetch(`<?php echo basename(__FILE__); ?>?action=get_item&id=${encodeURIComponent(id)}`);
-              const data = await res.json();
-              if (!data.ok) { alert('Failed to load item.'); return; }
-
-              switchToEditMode(id);
-              clearForm();
-
-              // Fill fields
-              feCategory.value = data.item.category || 'uniforms';
-              feName.value = data.item.item_name || '';
-              feDesc.value = data.item.description || '';
-              feBasePrice.value = (data.item.base_price !== null && data.item.base_price !== undefined) ? data.item.base_price : '';
-
-              // Existing images preview (for reference)
-              existingPreviewFE.innerHTML = '';
-              if (Array.isArray(data.images) && data.images.length) {
-                data.images.forEach((im, i) => {
-                  const d = document.createElement('div'); d.className = 'thumb';
-                  const ig = document.createElement('img'); ig.src = im.data_url;
-                  const tg = document.createElement('span'); tg.className = 'tag'; tg.textContent = i === 0 ? 'Current Cover' : 'Current #' + (i + 1);
-                  d.appendChild(ig); d.appendChild(tg); existingPreviewFE.appendChild(d);
-                });
-              }
-
-              // Sizes
-              sizesTableFE.innerHTML = '';
-              if (Array.isArray(data.sizes) && data.sizes.length) {
-                data.sizes.forEach(s => addSizeRow({ label: s.label || '', price: s.price || 0, stock: (s.stock === null ? '' : s.stock), notes: s.notes || '' }));
-              } else {
-                addSizeRow();
-              }
-
-              // Reset images selection in case previous edit had files
-              feImages.value = '';
-              imgs = [];
-              imgPreviewFE.innerHTML = '';
-
-              updateAllPreviews();
-              openModal();
-            } catch (e) {
-              alert('Error: ' + e.message);
-            }
-          });
-        });
-
-        // Delete
+        // DELETE from list
         document.querySelectorAll('.btn-del-item').forEach(btn => {
           btn.addEventListener('click', () => {
             const id = btn.dataset.id;
             if (!confirm('Delete this item? This cannot be undone.')) return;
-            // Create and submit a form (POST) to delete
             const f = document.createElement('form');
             f.method = 'POST';
             f.action = '';
@@ -2437,6 +2890,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         });
 
       })();
+  </script>
+
+  <!-- POPUP FOR STOCKS <= 5 -->
+  <script>
+    const lowStocksData = <?php echo json_encode($lowStocks); ?>;
+    if (Array.isArray(lowStocksData) && lowStocksData.length) {
+      let msg = 'The following item sizes have stock of 5 or below:\n\n';
+      msg += lowStocksData.map(it =>
+        `${it.category} - ${it.item_name} (${it.label}): ${it.stock} pcs`
+      ).join('\n');
+      alert(msg);
+    }
   </script>
 
   <!-- =========================
@@ -2631,18 +3096,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       min-height: 0 !important;
     }
 
-    /* Give the list its own vertical scroller */
     .rgo-msg-list {
       overflow-y: auto !important;
       overflow-x: hidden;
       max-height: 100% !important;
       -webkit-overflow-scrolling: touch;
-      /* iOS smooth */
       overscroll-behavior: contain;
-      /* keep scroll inside the pane */
     }
 
-    /* Optional: always show a slim scrollbar on desktop */
     .rgo-msg-list::-webkit-scrollbar {
       width: 8px;
     }
@@ -2661,7 +3122,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       background: #94a3b8;
     }
 
-    /* Keep the whole inbox sized so the inner area can scroll nicely */
     .rgo-inbox {
       height: 560px;
       max-height: calc(100vh - 36px);
@@ -2671,17 +3131,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       height: calc(100% - 52px);
     }
 
-    /* header is ~52px */
-
-    .sidebar .sidebar-btn:is(:where(:first-child, :not(:first-child))) {
-      /* We’ll target it precisely via JS and set display:none; this is fallback */
-    }
-
     .sidebar .sidebar-btn[data-rgo-notifs="1"] {
       display: none !important;
     }
 
-    /* Threads panel: FB-ish look */
     .rgo-threads {
       background: #fff !important;
       border-right: 1px solid #e5e7eb;
@@ -2730,7 +3183,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       white-space: nowrap;
     }
 
-    /* Unread styling */
     .rgo-thread.unread .nm {
       font-weight: 800 !important;
     }
@@ -2748,7 +3200,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       margin-left: 8px;
     }
 
-    /* Sticky search on top of the threads */
     .rgo-recents-head {
       position: sticky;
       top: 0;
@@ -2776,7 +3227,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       font-size: 14px;
     }
 
-    /* Floating Messenger button (bottom-right) */
     .rgo-fab {
       position: fixed;
       right: 18px;
@@ -2800,7 +3250,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       filter: brightness(1.05);
     }
 
-    /* Make threads column a little wider like FB */
     .rgo-inbox .body {
       grid-template-columns: 340px 1fr !important;
     }
@@ -2856,7 +3305,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       }
       closeBtn.addEventListener('click', closeInbox);
 
-      // Hook your existing "Notifications" button to open Inbox (no HTML edits)
+      // Hook Notifications button
       document.querySelector('.sidebar')?.addEventListener('click', (e) => {
         const t = e.target;
         if (t.classList.contains('sidebar-btn') && /notifications/i.test(t.textContent || '')) {
@@ -2917,7 +3366,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       async function fetchMsgs(initial = false) {
         if (!activeSid) return;
         try {
-          // admin view – pulls BOTH student & admin from the same table
           const url = new URL(location.href);
           url.searchParams.set('action', 'chat_fetch_admin');
           url.searchParams.set('student_id', String(activeSid));
@@ -2927,7 +3375,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           if (!data.ok) return;
 
           (data.messages || []).forEach(m => {
-            const sender = (m.sender === 'admin') ? 'admin' : 'student'; // anything not 'admin' => student
+            const sender = (m.sender === 'admin') ? 'admin' : 'student';
             addBubble(sender, m.message);
             if (!lastMsgId || m.id > lastMsgId) lastMsgId = m.id;
           });
@@ -2952,7 +3400,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
             input.value = '';
             lastMsgId = Math.max(lastMsgId, data.message?.id || lastMsgId);
             scrollToBottom();
-            refreshThreads(); // clear unread & update preview
+            refreshThreads();
           } else {
             alert(data.msg || 'Failed to send.');
           }
@@ -2968,32 +3416,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); sendMsg(); } });
       sendBtn.addEventListener('click', sendMsg);
 
-      // Optional: open inbox automatically if query ?open=inbox
       try { const q = new URLSearchParams(location.search); if (q.get('open') === 'inbox') openInbox(); } catch { }
     })();
 
     (function () {
-      // Re-select safely (doesn't rely on earlier JS scope)
       const inbox = document.querySelector('.rgo-inbox');
       const msgWrap = document.getElementById('rgoMsgList');
-
       if (!inbox || !msgWrap) return;
 
-      // Ensure the pane always has a height to scroll within
       function sizePane() {
-        // Parent (.rgo-msgs) has full height; .rgo-msg-list flexes inside it.
-        // Force a numeric height so some browsers render the scrollbar reliably.
         const msgs = msgWrap.closest('.rgo-msgs');
         if (!msgs) return;
         const rect = msgs.getBoundingClientRect();
-        // subtract input area height (~60-72px). We’ll measure it precisely if available.
         const input = msgs.querySelector('.rgo-input');
-        const pad = 0;
-        const h = rect.height - (input ? input.getBoundingClientRect().height : 70) - pad;
+        const h = rect.height - (input ? input.getBoundingClientRect().height : 70);
         if (h > 120) msgWrap.style.maxHeight = h + 'px';
       }
 
-      // Smoothly jump to bottom when needed (only when already near bottom)
       function scrollToBottom(force = false) {
         if (!msgWrap) return;
         const nearBottom = (msgWrap.scrollHeight - (msgWrap.scrollTop + msgWrap.clientHeight)) < 80;
@@ -3002,38 +3441,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         }
       }
 
-      // Try to scroll to bottom when the inbox opens (observer watches display change)
       const obs = new MutationObserver(() => {
         if (getComputedStyle(inbox).display !== 'none') {
           sizePane();
-          // slight delay so layout settles
           setTimeout(() => scrollToBottom(true), 60);
         }
       });
       obs.observe(inbox, { attributes: true, attributeFilter: ['style', 'class'] });
 
-      // Resize handling
       window.addEventListener('resize', sizePane);
 
-      // When new bubbles are appended by your existing code, they change scrollHeight.
-      // Observe children to auto-size and keep you at bottom if you were already there.
       const childObs = new MutationObserver(() => { sizePane(); scrollToBottom(false); });
       childObs.observe(msgWrap, { childList: true, subtree: false });
 
-      // Improve wheel/touch behavior inside the pane so it doesn't “trap” the page
       msgWrap.addEventListener('wheel', (e) => {
         const atTop = msgWrap.scrollTop === 0 && e.deltaY < 0;
         const atBottom = Math.ceil(msgWrap.scrollTop + msgWrap.clientHeight) >= msgWrap.scrollHeight && e.deltaY > 0;
         if (atTop || atBottom) e.stopPropagation();
       }, { passive: true });
 
-      // Initial pass (in case it starts opened via ?open=inbox)
       sizePane();
       setTimeout(() => scrollToBottom(true), 100);
     })();
 
     (function () {
-      // 1) Mark & hide the original Notifications button (keep for programmatic click)
       const notifBtn = Array.from(document.querySelectorAll('.sidebar .sidebar-btn'))
         .find(b => /notifications/i.test(b?.textContent || ''));
       if (notifBtn) {
@@ -3041,30 +3472,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         notifBtn.style.display = 'none';
       }
 
-      // 2) Add floating Messenger FAB that opens the inbox by "clicking" the hidden button
       const fab = document.createElement('button');
       fab.className = 'rgo-fab';
       fab.setAttribute('aria-label', 'Open chats');
       fab.innerHTML = '💬';
       fab.addEventListener('click', () => {
-        // If inbox already in DOM, just show it by triggering the same code path:
         if (notifBtn) notifBtn.click();
         else {
-          // Fallback: if the inbox exists but is hidden, show it
           const box = document.querySelector('.rgo-inbox');
           if (box) { box.style.display = 'block'; }
         }
       });
       document.body.appendChild(fab);
 
-      // 3) Decorate the threads list to look/behave like Facebook recents
       const threads = document.getElementById('rgoThreads');
 
-      // Build (or rebuild) the search header and move rows into a list container
       function decorateThreads() {
         if (!threads) return;
 
-        // Create head if missing
         let head = threads.querySelector('.rgo-recents-head');
         if (!head) {
           head = document.createElement('div');
@@ -3075,42 +3500,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
           <input id="rgoSearchInput" type="text" placeholder="Search chats">
         </div>
       `;
-          // Insert at top
           threads.prepend(head);
         }
 
-        // Ensure there is a container to hold only rows
         let list = threads.querySelector('.rgo-thread-list');
         if (!list) {
           list = document.createElement('div');
           list.className = 'rgo-thread-list';
-          // Move any existing rows into the list
           Array.from(threads.querySelectorAll('.rgo-thread')).forEach(r => list.appendChild(r));
           head.insertAdjacentElement('afterend', list);
         } else {
-          // If rows were re-rendered directly under threads, move them back into the list
           Array.from(threads.children).forEach(ch => {
             if (ch !== head && ch !== list) {
-              // likely newly rendered row
               if (ch.classList?.contains('rgo-thread')) list.appendChild(ch);
             }
           });
         }
 
-        // Unread badge → add .unread and a blue dot (FB-like)
         list.querySelectorAll('.rgo-thread').forEach(row => {
           const hasUnread = !!row.querySelector('.badge') && Number(row.querySelector('.badge')?.textContent || 0) > 0;
           row.classList.toggle('unread', hasUnread);
-          // Add dot once
           if (hasUnread && !row.querySelector('.dot')) {
             const dot = document.createElement('div'); dot.className = 'dot';
-            // put dot at the far right in the right-time container, or create one
             const rightCell = row.querySelector('.time')?.parentElement || row;
             rightCell.appendChild(dot);
           }
         });
 
-        // Search filtering
         const input = head.querySelector('#rgoSearchInput');
         if (input && !input._wired) {
           input._wired = true;
@@ -3124,14 +3540,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
         }
       }
 
-      // Observe changes to the threads container; the original script re-renders rows
       const obs = new MutationObserver(() => {
-        // Run after the original code updates the list
         requestAnimationFrame(decorateThreads);
       });
       if (threads) obs.observe(threads, { childList: true, subtree: false });
 
-      // If inbox loads later, try again
       const bodyObs = new MutationObserver(() => {
         const t = document.getElementById('rgoThreads');
         if (t && t !== threads) {
@@ -3145,17 +3558,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
       });
       bodyObs.observe(document.body, { childList: true, subtree: true });
 
-      // If the inbox is already open, decorate immediately
       setTimeout(decorateThreads, 200);
     })();
 
 
-    // Open Add Student Panel
+    // Open Add Student/Admin Panels
     document.getElementById("openAddStudent").onclick = () => {
       document.getElementById("panelAddStudent").classList.add("show");
     };
-
-    // Open Add Admin Panel
     document.getElementById("openAddAdmin").onclick = () => {
       document.getElementById("panelAddAdmin").classList.add("show");
     };
@@ -3163,7 +3573,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_item']) && iss
     setInterval(() => {
       fetch("heartbeat.php");
     }, 30000);
-
 
     const signoutBtn = document.getElementById("signoutBtn");
     signoutBtn.addEventListener("click", () => {

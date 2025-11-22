@@ -308,7 +308,7 @@ header img {
 .sidebar-btn {
     width: 100%;
     background-color: #d62828;
-    color: white;
+    color: rgba(0, 0, 0, 0.416);
     border: none;
     border-radius: 8px;
     padding: 12px;
@@ -434,7 +434,7 @@ header img {
 }
 
 .checkout-btn:hover {
-    background-color: #ffe066;
+    background-color: rgba(255, 255, 255, 0.244);
 }
 
 /* MODAL */

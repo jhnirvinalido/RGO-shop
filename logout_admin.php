@@ -15,6 +15,6 @@ if (isset($_SESSION['admin_login_id'])) {
     unset($_SESSION['admin_login_id'], $_SESSION['admin_id'], $_SESSION['admin_name'], $_SESSION['admin_position']);
 }
 
-header("Location: UserLogin.php");
+header("Location: index.php");
 exit();
 ?>

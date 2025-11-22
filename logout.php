@@ -15,6 +15,6 @@ if (isset($_SESSION['student_id'])) {
     unset($_SESSION['student_id'], $_SESSION['fullname'], $_SESSION['sr_code'], $_SESSION['course']);
 }
 
-header("Location: UserLogin.php");
+header("Location: index.php");
 exit();
 ?>
